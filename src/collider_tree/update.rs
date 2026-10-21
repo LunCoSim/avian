@@ -16,7 +16,6 @@ use crate::{
 };
 use bevy::{
     ecs::{
-        change_detection::Tick,
         entity_disabling::Disabled,
         query::QueryFilter,
         system::{StaticSystemParam, SystemChangeTick},
@@ -42,21 +41,25 @@ impl<C: AnyCollider> Plugin for ColliderTreeUpdatePlugin<C> {
     fn build(&self, app: &mut App) {
         // Initialize resources.
         app.init_resource::<MovedProxies>()
-            .init_resource::<EnlargedProxies>()
-            .init_resource::<LastDynamicKinematicAabbUpdate>();
+            .init_resource::<EnlargedProxies>();
 
-        // Add systems for updating collider AABBs before physics step.
-        // This accounts for manually moved colliders.
+        // Refresh both authored poses and velocity-expanded bounds before collecting pairs.
+        // Newly admitted bodies and changed velocities must affect this step.
         app.add_systems(
             PhysicsSchedule,
-            update_moved_collider_aabbs::<C>
+            (
+                update_moved_collider_aabbs::<C>,
+                update_solver_body_aabbs::<C>,
+            )
+                .chain()
                 .in_set(ColliderTreeSystems::UpdateAabbs)
                 // Allowing ambiguities is required so that it's possible
                 // to have multiple collision backends at the same time.
                 .ambiguous_with_all(),
         );
 
-        // Clear moved proxies and update dynamic and kinematic collider AABBs.
+        // Publish completed collider poses for spatial queries and next-step prediction.
+        // Clear movement consumed by this step before recording those updates.
         app.add_systems(
             PhysicsSchedule,
             (clear_moved_proxies, update_solver_body_aabbs::<C>)
@@ -379,34 +382,34 @@ impl<C: AnyCollider> Plugin for ColliderTreeUpdatePlugin<C> {
             },
         );
 
-        // Case 11
-        app.add_observer(
-            |trigger: On<Discard<RigidBodyDisabled>>,
-             body_query: Query<(&RigidBodyColliders, Has<RigidBodyDisabled>)>,
-             mut collider_query: Query<&ColliderTreeProxyKey, Without<ColliderDisabled>>,
-             mut trees: ResMut<ColliderTrees>| {
-                let entity = trigger.entity;
+        // Case 11: Bevy removal observers run while the marker is still present.
+        app.add_observer(set_body_disabled_on::<Add<RigidBodyDisabled>, true>);
+        app.add_observer(set_body_disabled_on::<Remove<RigidBodyDisabled>, false>);
+    }
+}
 
-                let Ok((body_colliders, is_body_disabled)) = body_query.get(entity) else {
-                    return;
-                };
-
-                for collider_entity in body_colliders.iter() {
-                    let Ok(proxy_key) = collider_query.get_mut(collider_entity) else {
-                        continue;
-                    };
-
-                    let tree = trees.tree_for_type_mut(proxy_key.tree_type());
-
-                    // Update body disabled flag.
-                    if let Some(proxy) = tree.get_proxy_mut(proxy_key.id()) {
-                        proxy
-                            .flags
-                            .set(ColliderTreeProxyFlags::BODY_DISABLED, is_body_disabled);
-                    }
-                }
-            },
-        );
+fn set_body_disabled_on<E: EventPattern<Event: EntityEvent>, const BODY_DISABLED: bool>(
+    trigger: On<E>,
+    bodies: Query<&RigidBodyColliders>,
+    colliders: Query<&ColliderTreeProxyKey, Without<ColliderDisabled>>,
+    mut trees: ResMut<ColliderTrees>,
+    mut moved: ResMut<MovedProxies>,
+) {
+    let Ok(attached) = bodies.get(trigger.event_target()) else {
+        return;
+    };
+    for collider in attached.iter() {
+        let Ok(key) = colliders.get(collider) else {
+            continue;
+        };
+        let tree = trees.tree_for_type_mut(key.tree_type());
+        if let Some(proxy) = tree.get_proxy_mut(key.id()) {
+            proxy
+                .flags
+                .set(ColliderTreeProxyFlags::BODY_DISABLED, BODY_DISABLED);
+            moved.insert(*key);
+            tree.moved_proxies.push(key.id());
+        }
     }
 }
 
@@ -528,11 +531,6 @@ fn remove_from_tree_on<E: EventPattern<Event: EntityEvent>, F: QueryFilter>(
     // Invalidate the proxy key.
     *proxy_key = ColliderTreeProxyKey::PLACEHOLDER;
 }
-
-/// A resource for tracking the last system change tick
-/// when dynamic or kinematic collider AABBs were updated.
-#[derive(Resource, Default)]
-struct LastDynamicKinematicAabbUpdate(Tick);
 
 /// A resource for tracking moved proxies.
 ///
@@ -681,7 +679,7 @@ impl EnlargedProxiesBitVec {
 }
 
 /// Updates the AABBs of the colliders of each [`SolverBody`] (awake dynamic and kinematic bodies)
-/// after the physics step.
+/// before collision detection and after the completed physics step.
 ///
 /// [`SolverBody`]: crate::dynamics::solver::solver_body::SolverBody
 // TODO: Once dynamic an kinematic bodies have their own marker components,
@@ -723,12 +721,8 @@ fn update_solver_body_aabbs<C: AnyCollider>(
     mut enlarged_proxies: ResMut<EnlargedProxies>,
     collider_context: StaticSystemParam<C::Context>,
     mut diagnostics: ResMut<ColliderTreeDiagnostics>,
-    mut last_tick: ResMut<LastDynamicKinematicAabbUpdate>,
-    system_tick: SystemChangeTick,
 ) {
     let start = crate::utils::Instant::now();
-
-    let this_run = system_tick.this_run();
 
     // An upper bound on the number of proxies, for sizing the bit vectors.
     // TODO: Use a better way to track the number of proxies.
@@ -850,10 +844,6 @@ fn update_solver_body_aabbs<C: AnyCollider>(
             &mut moved_proxies,
         );
     }
-
-    // Update the last update tick.
-    // TODO: Remove this
-    last_tick.0 = this_run;
 
     diagnostics.update += start.elapsed();
 }
@@ -1102,6 +1092,85 @@ mod tests {
     use super::*;
     use bevy::time::TimeUpdateStrategy;
     use core::time::Duration;
+
+    #[test]
+    fn native_body_admission_updates_attached_collider_proxies() {
+        use crate::collider_tree::{
+            ColliderTreeProxyFlags, ColliderTreeProxyKey, ColliderTreeType, ColliderTrees,
+        };
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            bevy::mesh::MeshPlugin,
+            bevy::diagnostic::DiagnosticsPlugin,
+            PhysicsPlugins::default(),
+        ));
+        app.finish();
+        app.cleanup();
+        let body = app
+            .world_mut()
+            .spawn((
+                RigidBody::Kinematic,
+                RigidBodyDisabled,
+                GlobalTransform::default(),
+            ))
+            .id();
+        let colliders = [0.0, 2.0].map(|x| {
+            app.world_mut()
+                .spawn((
+                    Collider::sphere(0.5),
+                    Transform::from_xyz(x, 0.0, 0.0),
+                    GlobalTransform::default(),
+                    ChildOf(body),
+                ))
+                .id()
+        });
+        app.world_mut().flush();
+        app.world_mut()
+            .entity_mut(body)
+            .insert(RigidBody::Dynamic)
+            .remove::<RigidBodyDisabled>();
+        app.world_mut().flush();
+        for collider in colliders {
+            let key = app.world().get::<ColliderTreeProxyKey>(collider).unwrap();
+            let proxy = app
+                .world()
+                .resource::<ColliderTrees>()
+                .get_proxy(*key)
+                .unwrap();
+            assert_eq!(key.tree_type(), ColliderTreeType::Dynamic);
+            assert_eq!(proxy.collider, collider);
+            assert_eq!(proxy.body, Some(body));
+            assert!(!proxy.flags.contains(ColliderTreeProxyFlags::BODY_DISABLED));
+            assert_eq!(app.world().get::<ColliderOf>(collider).unwrap().body, body);
+            assert!(app.world().get::<ColliderDisabled>(collider).is_none());
+        }
+        assert_eq!(
+            app.world()
+                .get::<RigidBodyColliders>(body)
+                .unwrap()
+                .iter()
+                .count(),
+            colliders.len()
+        );
+        for disabled in [true, false] {
+            if disabled {
+                app.world_mut().entity_mut(body).insert(RigidBodyDisabled);
+            } else {
+                app.world_mut().entity_mut(body).remove::<RigidBodyDisabled>();
+            }
+            app.world_mut().flush();
+            for collider in colliders {
+                let key = *app.world().get::<ColliderTreeProxyKey>(collider).unwrap();
+                let proxy = app.world().resource::<ColliderTrees>().get_proxy(key).unwrap();
+                assert_eq!(
+                    proxy.flags.contains(ColliderTreeProxyFlags::BODY_DISABLED),
+                    disabled
+                );
+            }
+        }
+    }
 
     /// Removing a collider's rigid body (Case 3) moves its proxy to the
     /// standalone tree. The `ColliderTreeProxyKey` on the entity has to follow,

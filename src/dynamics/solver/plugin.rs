@@ -141,6 +141,8 @@ impl Plugin for SolverPlugin {
             prepare_contact_constraints.in_set(SolverSystems::PrepareContactConstraints),
         );
 
+        physics.add_systems(clear_joint_forces.in_set(PhysicsStepSystems::First));
+
         // Apply restitution.
         physics.add_systems(solve_restitution.in_set(SolverSystems::Restitution));
 
@@ -1090,13 +1092,21 @@ fn store_contact_impulses(
     diagnostics.store_impulses += start.elapsed();
 }
 
+/// Begin one completed-step joint reaction measurement.
+fn clear_joint_forces(mut joints: Query<&mut JointForces>) {
+    for mut forces in &mut joints {
+        *forces = JointForces::default();
+    }
+}
+
 /// Applies velocity corrections caused by joint damping.
 #[allow(clippy::type_complexity)]
 pub fn joint_damping<T: Component + EntityConstraint<2>>(
     mut solver_bodies: ResMut<SolverBodies>,
-    index_query: Query<&SolverBodyIndex>,
-    joints: Query<(&T, &JointDamping)>,
+    index_query: Query<&SolverBodyIndex, Without<RigidBodyDisabled>>,
+    mut joints: Query<(&T, &JointDamping, Option<&mut JointForces>), Without<JointDisabled>>,
     time: Res<Time>,
+    physics_time: Res<Time<Physics>>,
 ) {
     let delta_secs = time.delta_secs();
 
@@ -1105,7 +1115,7 @@ pub fn joint_damping<T: Component + EntityConstraint<2>>(
     let mut dummy_body1 = SolverBody::DUMMY;
     let mut dummy_body2 = SolverBody::DUMMY;
 
-    for (joint, damping) in &joints {
+    for (joint, damping, forces) in &mut joints {
         let entities = joint.entities();
 
         // Map the two jointed entities to their solver body indices, using an invalid index
@@ -1167,6 +1177,14 @@ pub fn joint_damping<T: Component + EntityConstraint<2>>(
 
         body1.linear_velocity += p * w1;
         body2.linear_velocity -= p * w2;
+
+        if let Some(mut forces) = forces {
+            let inverse_dt = physics_time.delta_secs().recip_or_zero();
+            let force = forces.force() - p * inverse_dt;
+            let torque = forces.torque() - angular_impulse * inverse_dt;
+            forces.set_force(force);
+            forces.set_torque(torque);
+        }
     }
 }
 

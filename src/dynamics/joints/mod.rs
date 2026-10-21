@@ -682,13 +682,15 @@ impl JointForces {
         }
     }
 
-    /// Returns the force applied by the joint.
+    /// Returns the completed-step average force applied to the second body,
+    /// including passive joint damping.
     #[inline]
     pub const fn force(&self) -> Vector {
         self.force
     }
 
-    /// Returns the torque applied by the joint.
+    /// Returns the completed-step average angular constraint and motor torque
+    /// applied to the second body, including passive joint damping.
     #[inline]
     pub const fn torque(&self) -> AngularVector {
         self.torque

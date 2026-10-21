@@ -1199,3 +1199,63 @@ fn compute_ccd_toi(
     let toi = hit.time_of_impact.f32();
     (toi > 0.0 && toi < min_toi).then_some(toi)
 }
+
+#[cfg(all(test, feature = "3d", feature = "default-collider"))]
+mod tests {
+    use crate::{math::RVector, prelude::*};
+    use bevy::{mesh::MeshPlugin, prelude::*, time::TimeUpdateStrategy};
+    use core::time::Duration;
+
+    #[test]
+    fn speculative_ccd_expands_new_fast_bodies_before_their_first_step() {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            MeshPlugin,
+            TransformPlugin,
+            bevy::diagnostic::DiagnosticsPlugin,
+            PhysicsPlugins::default(),
+        ));
+        app.insert_resource(Gravity(Vec3::ZERO));
+        app.insert_resource(SubstepCount(8));
+        app.insert_resource(Time::<Fixed>::from_hz(60.0));
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+            1.0 / 60.0,
+        )));
+        app.finish();
+        app.cleanup();
+        app.world_mut().spawn((
+            RigidBody::Static,
+            Collider::cuboid(1.0, 10.0, 10.0),
+            Position(RVector::new(3.0, 0.0, 0.0)),
+            Rotation::IDENTITY,
+        ));
+        let bodies = [(2.0, 1200.0), (0.0, 2400.0)].map(|(x, speed)| {
+            app.world_mut()
+                .spawn((
+                    RigidBody::Dynamic,
+                    Collider::sphere(0.1),
+                    Position(RVector::new(x, 0.0, 0.0)),
+                    Rotation::IDENTITY,
+                    LinearVelocity(Vec3::X * speed),
+                    Mass(1.0),
+                    SpeculativeCcd::MAX,
+                    SweptCcd::default().with_filter(CcdFilter::ALL),
+                    SleepingDisabled,
+                ))
+                .id()
+        });
+        for _ in 0..4 {
+            app.update();
+            let a = app.world().get::<Position>(bodies[0]).unwrap().0.x;
+            let b = app.world().get::<Position>(bodies[1]).unwrap().0.x;
+
+            assert!(
+                a >= b + 0.199,
+                "fast bodies crossed or overlapped: a={a}, b={b}"
+            );
+            assert!(a <= 2.401, "front body crossed the wall: a={a}");
+        }
+    }
+}

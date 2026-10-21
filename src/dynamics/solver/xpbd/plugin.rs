@@ -5,7 +5,6 @@ use crate::{
     dynamics::{
         joints::EntityConstraint,
         solver::{
-            SolverConfig,
             schedule::SubstepSolverSystems,
             solver_body::{SolverBodies, SolverBody, SolverBodyIndex, SolverBodyInertia},
             xpbd::{XpbdConstraint, XpbdConstraintSolverData},
@@ -55,21 +54,6 @@ impl Plugin for XpbdSolverPlugin {
             )
                 .chain()
                 .in_set(SolverSystems::PrepareJoints),
-        );
-
-        // Warm start motor constraints.
-        // These are chained to avoid ambiguity, and marked ambiguous_with the contact
-        // warm start since motor and contact warm starting are independent operations
-        // that both add to body velocities.
-        app.add_systems(
-            SubstepSchedule,
-            (
-                warm_start_xpbd_motors::<RevoluteJoint>,
-                warm_start_xpbd_motors::<PrismaticJoint>,
-            )
-                .chain()
-                .ambiguous_with_all()
-                .in_set(SubstepSolverSystems::WarmStart),
         );
 
         // Solve joints with XPBD.
@@ -226,75 +210,6 @@ pub fn solve_xpbd_joint<
     }
 }
 
-/// Warm starts the motor constraints for joints of a given type.
-///
-/// This applies the motor impulses from the previous frame as velocity changes,
-/// improving convergence for motors that need to maintain steady forces.
-pub fn warm_start_xpbd_motors<
-    C: Component<Mutability = Mutable> + EntityConstraint<2> + XpbdConstraint<2>,
->(
-    mut solver_bodies: ResMut<SolverBodies>,
-    index_query: Query<&SolverBodyIndex, Without<RigidBodyDisabled>>,
-    mut joints: Query<(&C, &mut C::SolverData), (Without<RigidBody>, Without<JointDisabled>)>,
-    time: Res<Time>,
-    solver_config: Res<SolverConfig>,
-) where
-    C::SolverData: Component<Mutability = Mutable>,
-{
-    let delta_secs = time.delta_secs();
-
-    let access = solver_bodies.access();
-
-    let mut dummy_body1 = SolverBody::default();
-    let mut dummy_body2 = SolverBody::default();
-
-    for (joint, mut solver_data) in &mut joints {
-        let [entity1, entity2] = joint.entities();
-
-        let index1 = index_query
-            .get(entity1)
-            .copied()
-            .unwrap_or(SolverBodyIndex::INVALID);
-        let index2 = index_query
-            .get(entity2)
-            .copied()
-            .unwrap_or(SolverBodyIndex::INVALID);
-
-        if index1 == index2 {
-            continue;
-        }
-
-        let (mut body1, mut inertia1) = (&mut dummy_body1, &SolverBodyInertia::DUMMY);
-        let (mut body2, mut inertia2) = (&mut dummy_body2, &SolverBodyInertia::DUMMY);
-
-        // SAFETY: The two jointed bodies are distinct, and joints are processed serially here.
-        let (b1, b2) = unsafe { access.get_pair_unchecked_mut(index1, index2) };
-        if let Some((body, inertia)) = b1 {
-            body1 = body;
-            inertia1 = inertia;
-        }
-        if let Some((body, inertia)) = b2 {
-            body2 = body;
-            inertia2 = inertia;
-        }
-
-        // If a body has a higher dominance, it is treated as a static or kinematic body.
-        match (inertia1.dominance() - inertia2.dominance()).cmp(&0) {
-            Ordering::Greater => inertia1 = &SolverBodyInertia::DUMMY,
-            Ordering::Less => inertia2 = &SolverBodyInertia::DUMMY,
-            _ => {}
-        }
-
-        joint.warm_start_motors(
-            [body1, body2],
-            [inertia1, inertia2],
-            &mut solver_data,
-            delta_secs,
-            solver_config.warm_start_coefficient,
-        );
-    }
-}
-
 /// Stores the delta position and rotation of each body before XPBD constraints are solved.
 fn store_pre_solve_deltas(
     solver_bodies: Res<SolverBodies>,
@@ -390,7 +305,7 @@ fn project_angular_velocity(
 }
 
 fn writeback_joint_forces<C: Component + EntityConstraint<2> + XpbdConstraint<2>>(
-    mut joints: Query<(&C::SolverData, &mut JointForces)>,
+    mut joints: Query<(&C::SolverData, &mut JointForces), Without<JointDisabled>>,
     time: Res<Time>,
     substep_count: Res<SubstepCount>,
 ) where
@@ -404,8 +319,10 @@ fn writeback_joint_forces<C: Component + EntityConstraint<2> + XpbdConstraint<2>
     let rhs = (delta_secs * delta_secs).recip_or_zero() * substep_count.0 as f32;
 
     for (solver_data, mut forces) in &mut joints {
-        forces.set_force(solver_data.total_position_lagrange() * rhs);
-        forces.set_torque(solver_data.total_rotation_lagrange() * rhs);
+        let force = forces.force() - solver_data.total_position_lagrange() * rhs;
+        let torque = forces.torque() - solver_data.total_rotation_lagrange() * rhs;
+        forces.set_force(force);
+        forces.set_torque(torque);
         forces.set_motor_force(solver_data.total_motor_lagrange() * rhs);
     }
 }

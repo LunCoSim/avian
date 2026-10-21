@@ -1,11 +1,8 @@
 use super::PointConstraintShared;
 use crate::{
-    dynamics::{
-        joints::{AngularMotor, MotorModel},
-        solver::{
-            solver_body::{SolverBody, SolverBodyInertia},
-            xpbd::*,
-        },
+    dynamics::solver::{
+        solver_body::{SolverBody, SolverBodyInertia},
+        xpbd::*,
     },
     prelude::*,
 };
@@ -34,9 +31,6 @@ pub struct RevoluteJointSolverData {
     pub(super) total_limit_lagrange: AngularVector,
     /// Accumulated motor Lagrange multiplier for this frame.
     pub(super) total_motor_lagrange: AngularVector,
-    /// Motor Lagrange multiplier from the previous frame, used for warm starting.
-    /// This is zeroed after being applied in the first substep.
-    pub(super) warm_start_motor_lagrange: AngularVector,
 }
 
 impl XpbdConstraintSolverData for RevoluteJointSolverData {
@@ -44,8 +38,6 @@ impl XpbdConstraintSolverData for RevoluteJointSolverData {
         self.point_constraint.clear_lagrange_multipliers();
         self.total_align_lagrange = AngularVector::default();
         self.total_limit_lagrange = AngularVector::default();
-        // Save motor lagrange for warm starting before clearing.
-        self.warm_start_motor_lagrange = self.total_motor_lagrange;
         self.total_motor_lagrange = AngularVector::default();
     }
 
@@ -173,32 +165,6 @@ impl XpbdConstraint<2> for RevoluteJoint {
             .point_constraint
             .solve([body1, body2], inertias, self.point_compliance, dt);
     }
-
-    fn warm_start_motors(
-        &self,
-        bodies: [&mut SolverBody; 2],
-        inertias: [&SolverBodyInertia; 2],
-        solver_data: &mut RevoluteJointSolverData,
-        _dt: f32,
-        warm_start_coefficient: f32,
-    ) {
-        if !self.motor.enabled {
-            return;
-        }
-
-        let [body1, body2] = bodies;
-        let [inertia1, inertia2] = inertias;
-
-        let inv_angular_inertia1 = inertia1.effective_inv_angular_inertia();
-        let inv_angular_inertia2 = inertia2.effective_inv_angular_inertia();
-
-        let impulse = warm_start_coefficient * solver_data.warm_start_motor_lagrange;
-
-        body1.angular_velocity -= inv_angular_inertia1 * impulse;
-        body2.angular_velocity += inv_angular_inertia2 * impulse;
-
-        solver_data.warm_start_motor_lagrange = AngularVector::default();
-    }
 }
 
 impl RevoluteJoint {
@@ -291,7 +257,7 @@ impl RevoluteJoint {
                     a1,
                 );
 
-        if w_sum <= f32::EPSILON {
+        if w_sum <= 0.0 {
             return;
         }
 
@@ -301,19 +267,22 @@ impl RevoluteJoint {
         let raw_error = motor.target_position - current_angle;
         let position_error = (raw_error + PI).rem_euclid(TAU) - PI;
 
-        let Some(delta_lagrange) =
-            Self::compute_angular_motor_lagrange(velocity_error, position_error, w_sum, motor, dt)
-        else {
-            return;
-        };
+        let delta_lagrange = super::motor_lagrange(
+            motor.motor_model,
+            position_error,
+            velocity_error,
+            w_sum,
+            motor.max_torque,
+            dt,
+        );
 
         #[cfg(feature = "2d")]
         {
-            solver_data.total_motor_lagrange += delta_lagrange;
+            solver_data.total_motor_lagrange -= delta_lagrange;
         }
         #[cfg(feature = "3d")]
         {
-            solver_data.total_motor_lagrange += delta_lagrange * a1;
+            solver_data.total_motor_lagrange -= delta_lagrange * a1;
         }
 
         // Positive delta_lagrange increases body2's angular velocity relative to body1.
@@ -334,55 +303,6 @@ impl RevoluteJoint {
             delta_lagrange,
             a1,
         );
-    }
-
-    /// Computes the Lagrange multiplier delta for an angular motor.
-    ///
-    /// Returns `None` if the correction is negligible.
-    fn compute_angular_motor_lagrange(
-        velocity_error: f32,
-        position_error: f32,
-        w_sum: f32,
-        motor: &AngularMotor,
-        dt: f32,
-    ) -> Option<f32> {
-        let target_velocity_change = match motor.motor_model {
-            MotorModel::SpringDamper {
-                frequency,
-                damping_ratio,
-            } => {
-                // Implicit Euler formulation for stable spring-damper behavior.
-                let omega = TAU * frequency;
-                let omega_sq = omega * omega;
-                let two_zeta_omega = 2.0 * damping_ratio * omega;
-                let inv_denominator = 1.0 / (1.0 + two_zeta_omega * dt + omega_sq * dt * dt);
-                (omega_sq * position_error + two_zeta_omega * velocity_error) * dt * inv_denominator
-            }
-            MotorModel::AccelerationBased { stiffness, damping } => {
-                damping * velocity_error + stiffness * position_error * dt
-            }
-            MotorModel::ForceBased { stiffness, damping } => {
-                // Velocity change = (stiffness * pos_error + damping * vel_error) * inv_inertia
-                (stiffness * position_error + damping * velocity_error) * w_sum
-            }
-        };
-
-        let correction = target_velocity_change * dt;
-        if correction.abs() <= f32::EPSILON {
-            return None;
-        }
-
-        let delta_lagrange = correction / w_sum;
-
-        // Clamp to limit instantaneous torque per substep.
-        let delta_lagrange = if motor.max_torque < f32::MAX && motor.max_torque > 0.0 {
-            let max_delta = motor.max_torque * dt * dt;
-            delta_lagrange.clamp(-max_delta, max_delta)
-        } else {
-            delta_lagrange
-        };
-
-        Some(delta_lagrange)
     }
 }
 

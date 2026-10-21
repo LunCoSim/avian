@@ -572,8 +572,8 @@ mod tests {
             MinimalPlugins,
             PhysicsPlugins::default(),
             TransformPlugin,
-            #[cfg(feature = "bevy_scene")]
             AssetPlugin::default(),
+            bevy::diagnostic::DiagnosticsPlugin,
             #[cfg(feature = "bevy_scene")]
             bevy::scene::ScenePlugin,
             MeshPlugin,

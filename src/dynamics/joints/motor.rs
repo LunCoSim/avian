@@ -12,10 +12,10 @@ use bevy::prelude::*;
 pub enum MotorModel {
     /// A spring-damper model using implicit Euler integration.
     ///
-    /// Unlike the other models, this is unconditionally stable: the implicit formulation
-    /// naturally limits the response as frequency increases, preventing overshoot and
-    /// oscillation even with aggressive parameters. This makes it easier to tune than
-    /// the other models, which can become unstable with high stiffness values.
+    /// This is unconditionally stable: the implicit formulation
+    /// limits the response as frequency increases, avoiding numerical divergence
+    /// for nonnegative gains. Frequency and damping ratio
+    /// describe the response independently of the connected body masses.
     ///
     /// This is the recommended model for most use cases.
     ///
@@ -44,8 +44,8 @@ pub enum MotorModel {
     ///
     /// This produces physically accurate forces/torques, but requires careful tuning of the
     /// stiffness and damping parameters based on the masses of the connected bodies.
-    /// High stiffness values can cause instability (overshoot, oscillation, or divergence),
-    /// so parameters must be chosen appropriately for your timestep and mass configuration.
+    /// The force law is integrated implicitly at each substep. The resulting response
+    /// depends on the connected body masses and the substep duration.
     ///
     /// # Parameters
     ///
@@ -71,8 +71,9 @@ pub enum MotorModel {
     /// It is therefore easier to tune compared to the [`ForceBased`](MotorModel::ForceBased) model,
     /// which requires manual adjustment of stiffness and damping based on mass.
     ///
-    /// Note that high stiffness values can still cause instability. For unconditionally
-    /// stable behavior, use the [`SpringDamper`](MotorModel::SpringDamper) model instead.
+    /// The acceleration law is integrated implicitly at each substep.
+    /// [`SpringDamper`](MotorModel::SpringDamper) expresses the same kind of response
+    /// using frequency and damping ratio.
     ///
     /// # Parameters
     ///

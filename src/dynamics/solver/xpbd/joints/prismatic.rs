@@ -1,17 +1,12 @@
 use super::FixedAngleConstraintShared;
 use crate::{
-    dynamics::{
-        joints::MotorModel,
-        solver::{
-            solver_body::{SolverBody, SolverBodyInertia},
-            xpbd::*,
-        },
+    dynamics::solver::{
+        solver_body::{SolverBody, SolverBodyInertia},
+        xpbd::*,
     },
     prelude::*,
 };
 use bevy::prelude::*;
-
-use core::f32::consts::TAU;
 
 /// Constraint data required by the XPBD constraint solver for a [`PrismaticJoint`].
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Reflect)]
@@ -27,17 +22,12 @@ pub struct PrismaticJointSolverData {
     pub(super) angle_constraint: FixedAngleConstraintShared,
     /// Accumulated motor Lagrange multiplier for this frame.
     pub(super) total_motor_lagrange: f32,
-    /// Motor Lagrange multiplier from the previous frame, used for warm starting.
-    /// This is zeroed after being applied in the first substep.
-    pub(super) warm_start_motor_lagrange: f32,
 }
 
 impl XpbdConstraintSolverData for PrismaticJointSolverData {
     fn clear_lagrange_multipliers(&mut self) {
         self.total_position_lagrange = Vector::ZERO;
         self.angle_constraint.clear_lagrange_multipliers();
-        // Save motor lagrange for warm starting before clearing.
-        self.warm_start_motor_lagrange = self.total_motor_lagrange;
         self.total_motor_lagrange = 0.0;
     }
 
@@ -112,40 +102,6 @@ impl XpbdConstraint<2> for PrismaticJoint {
 
         // Constrain the relative positions of the bodies, only allowing translation along one free axis.
         self.constrain_positions(body1, body2, inertias[0], inertias[1], solver_data, dt);
-    }
-
-    fn warm_start_motors(
-        &self,
-        bodies: [&mut SolverBody; 2],
-        inertias: [&SolverBodyInertia; 2],
-        solver_data: &mut PrismaticJointSolverData,
-        _dt: f32,
-        warm_start_coefficient: f32,
-    ) {
-        if !self.motor.enabled {
-            return;
-        }
-
-        let [body1, body2] = bodies;
-        let [inertia1, inertia2] = inertias;
-
-        let inv_mass1 = inertia1.effective_inv_mass();
-        let inv_mass2 = inertia2.effective_inv_mass();
-        let inv_angular_inertia1 = inertia1.effective_inv_angular_inertia();
-        let inv_angular_inertia2 = inertia2.effective_inv_angular_inertia();
-
-        let axis = body1.delta_rotation * solver_data.free_axis1;
-        let world_r1 = body1.delta_rotation * solver_data.world_r1;
-        let world_r2 = body2.delta_rotation * solver_data.world_r2;
-
-        let impulse = warm_start_coefficient * solver_data.warm_start_motor_lagrange * axis;
-
-        body1.linear_velocity -= impulse * inv_mass1;
-        body2.linear_velocity += impulse * inv_mass2;
-        body1.angular_velocity -= inv_angular_inertia1 * cross(world_r1, impulse);
-        body2.angular_velocity += inv_angular_inertia2 * cross(world_r2, impulse);
-
-        solver_data.warm_start_motor_lagrange = 0.0;
     }
 }
 
@@ -270,7 +226,8 @@ impl PrismaticJoint {
             + (world_r2 - world_r1)
             + solver_data.center_difference;
         let current_position = separation.dot(axis1);
-        let current_velocity = (body2.linear_velocity - body1.linear_velocity).dot(axis1);
+        let current_velocity =
+            (body2.velocity_at_point(world_r2) - body1.velocity_at_point(world_r1)).dot(axis1);
 
         let inv_mass1 = inertia1.effective_inv_mass();
         let inv_mass2 = inertia2.effective_inv_mass();
@@ -293,53 +250,26 @@ impl PrismaticJoint {
         );
 
         let w_sum = w1 + w2;
-        if w_sum <= f32::EPSILON {
+        if w_sum <= 0.0 {
             return;
         }
 
         let velocity_error = motor.target_velocity - current_velocity;
         let position_error = motor.target_position - current_position;
 
-        let target_velocity_change = match motor.motor_model {
-            MotorModel::SpringDamper {
-                frequency,
-                damping_ratio,
-            } => {
-                // Implicit Euler formulation for stable spring-damper behavior.
-                let omega = TAU * frequency;
-                let omega_sq = omega * omega;
-                let two_zeta_omega = 2.0 * damping_ratio * omega;
-                let inv_denominator = 1.0 / (1.0 + two_zeta_omega * dt + omega_sq * dt * dt);
-                (omega_sq * position_error + two_zeta_omega * velocity_error) * dt * inv_denominator
-            }
-            MotorModel::AccelerationBased { stiffness, damping } => {
-                damping * velocity_error + stiffness * position_error * dt
-            }
-            MotorModel::ForceBased { stiffness, damping } => {
-                // Velocity change = (stiffness * pos_error + damping * vel_error) * inv_mass
-                (stiffness * position_error + damping * velocity_error) * w_sum
-            }
-        };
-
-        let correction = target_velocity_change * dt;
-        if correction.abs() <= f32::EPSILON {
-            return;
-        }
-
-        let delta_lagrange = correction / w_sum;
-
-        // Clamp to limit instantaneous force per substep.
-        let delta_lagrange = if motor.max_force < f32::MAX && motor.max_force > 0.0 {
-            let max_delta = motor.max_force * dt * dt;
-            delta_lagrange.clamp(-max_delta, max_delta)
-        } else {
-            delta_lagrange
-        };
+        let delta_lagrange = super::motor_lagrange(
+            motor.motor_model,
+            position_error,
+            velocity_error,
+            w_sum,
+            motor.max_force,
+            dt,
+        );
 
         solver_data.total_motor_lagrange += delta_lagrange;
 
         let impulse = delta_lagrange * axis1;
-        solver_data.total_position_lagrange += impulse;
+        solver_data.total_position_lagrange -= impulse;
 
         // Negate impulse: apply_positional_impulse convention is opposite to motor direction.
         self.apply_positional_impulse(

@@ -13,8 +13,8 @@ fn create_app() -> App {
         MinimalPlugins,
         PhysicsPlugins::default(),
         TransformPlugin,
-        #[cfg(feature = "bevy_scene")]
         AssetPlugin::default(),
+        bevy::diagnostic::DiagnosticsPlugin,
         #[cfg(feature = "bevy_scene")]
         bevy::scene::ScenePlugin,
         MeshPlugin,
@@ -1063,4 +1063,226 @@ fn joint_damping_damps_free_axis_of_rotation_locked_body() {
 
     let spin = app.world().get::<AngularVelocity>(body).unwrap().y;
     assert!(spin.abs() < 0.05, "free axis was not damped: {spin}");
+}
+
+/// A zero actuator cap must stay zero across frames and both joint kernels.
+#[cfg(feature = "3d")]
+#[test]
+fn motor_zero_caps_do_not_actuate_either_joint_kind() {
+    let mut app = create_app();
+    app.finish();
+    let anchor = app
+        .world_mut()
+        .spawn((RigidBody::Static, Position(RVector::ZERO)))
+        .id();
+    let bodies = [0, 1].map(|_| {
+        app.world_mut()
+            .spawn((
+                RigidBody::Dynamic,
+                Position(RVector::ZERO),
+                Mass(1.0),
+                AngularInertia::new(Vec3::ONE),
+            ))
+            .id()
+    });
+    let model = MotorModel::ForceBased {
+        stiffness: 1000.0,
+        damping: 100.0,
+    };
+    let linear = app
+        .world_mut()
+        .spawn((
+            PrismaticJoint::new(anchor, bodies[0]).with_motor(
+                LinearMotor::new(model)
+                    .with_target_position(0.1)
+                    .with_max_force(0.0),
+            ),
+            JointForces::default(),
+        ))
+        .id();
+    let angular = app
+        .world_mut()
+        .spawn((
+            RevoluteJoint::new(anchor, bodies[1]).with_motor(
+                AngularMotor::new(model)
+                    .with_target_position(0.1)
+                    .with_max_torque(0.0),
+            ),
+            JointForces::default(),
+        ))
+        .id();
+    for _ in 0..65 {
+        app.update();
+    }
+    for body in bodies {
+        assert_eq!(
+            app.world().get::<LinearVelocity>(body).unwrap().0,
+            Vec3::ZERO
+        );
+        assert_eq!(
+            app.world().get::<AngularVelocity>(body).unwrap().0,
+            Vec3::ZERO
+        );
+    }
+    for joint in [linear, angular] {
+        let forces = app.world().get::<JointForces>(joint).unwrap();
+        assert_eq!(forces.force(), Vec3::ZERO);
+        assert_eq!(forces.torque(), Vec3::ZERO);
+        assert_eq!(forces.motor_force(), 0.0);
+    }
+}
+
+/// Dimensional force gains must remain stable on low-mass endpoints.
+#[cfg(feature = "3d")]
+#[test]
+fn motor_force_drives_remain_finite_with_small_mass_and_inertia() {
+    let mut app = create_app();
+    app.finish();
+    let anchor = app
+        .world_mut()
+        .spawn((RigidBody::Static, Position(RVector::ZERO)))
+        .id();
+    let bodies = [0, 1].map(|_| {
+        app.world_mut()
+            .spawn((
+                RigidBody::Dynamic,
+                Position(RVector::ZERO),
+                Mass(0.001),
+                AngularInertia::new(Vec3::splat(1.0e-6)),
+                SleepingDisabled,
+            ))
+            .id()
+    });
+    let model = MotorModel::ForceBased {
+        stiffness: 1000.0,
+        damping: 100.0,
+    };
+    app.world_mut().spawn(
+        PrismaticJoint::new(anchor, bodies[0])
+            .with_slider_axis(Vec3::Y)
+            .with_motor(LinearMotor::new(model).with_target_position(0.1)),
+    );
+    app.world_mut().spawn(
+        RevoluteJoint::new(anchor, bodies[1])
+            .with_motor(AngularMotor::new(model).with_target_position(0.1)),
+    );
+    for _ in 0..65 {
+        app.update();
+        for body in bodies {
+            assert!(
+                app.world()
+                    .get::<LinearVelocity>(body)
+                    .unwrap()
+                    .0
+                    .is_finite()
+            );
+            assert!(
+                app.world()
+                    .get::<AngularVelocity>(body)
+                    .unwrap()
+                    .0
+                    .is_finite()
+            );
+        }
+    }
+    assert_relative_eq!(
+        app.world().get::<Position>(bodies[0]).unwrap().0.y,
+        0.1,
+        epsilon = 1.0e-4
+    );
+    assert_relative_eq!(
+        app.world()
+            .get::<Rotation>(bodies[1])
+            .unwrap()
+            .0
+            .to_scaled_axis()
+            .z,
+        0.1,
+        epsilon = 1.0e-4
+    );
+}
+
+/// Disabling a joint stops its damping and retires its completed reaction.
+#[cfg(feature = "3d")]
+#[test]
+fn joint_disabled_clears_completed_reactions_and_damping() {
+    let mut app = create_app();
+    app.finish();
+    let anchor = app
+        .world_mut()
+        .spawn((RigidBody::Static, Position(RVector::ZERO)))
+        .id();
+    let body = app
+        .world_mut()
+        .spawn((
+            RigidBody::Dynamic,
+            Position(RVector::ZERO),
+            Mass(1.0),
+            AngularInertia::new(Vec3::ONE),
+            AngularVelocity(Vec3::Z * 2.0),
+            SleepingDisabled,
+        ))
+        .id();
+    let joint = app
+        .world_mut()
+        .spawn((
+            RevoluteJoint::new(anchor, body),
+            JointDamping {
+                linear: 0.0,
+                angular: 20.0,
+            },
+            JointForces::default(),
+        ))
+        .id();
+    app.update();
+    app.update();
+    let before = app.world().get::<AngularVelocity>(body).unwrap().0;
+    assert!(app.world().get::<JointForces>(joint).unwrap().torque().z < 0.0);
+    app.world_mut().entity_mut(joint).insert(JointDisabled);
+    app.update();
+    assert_eq!(app.world().get::<AngularVelocity>(body).unwrap().0, before);
+    assert_eq!(
+        app.world().get::<JointForces>(joint).unwrap().torque(),
+        Vec3::ZERO
+    );
+}
+
+#[cfg(feature = "3d")]
+#[test]
+fn rotating_fixed_joint_preserves_offset_and_orientation() {
+    let mut app = create_app();
+    app.insert_resource(SubstepCount(8));
+    app.finish();
+    let bodies = [
+        (RVector::ZERO, Vec3::Y * (30.0 * core::f32::consts::PI)),
+        (RVector::X, Vec3::ZERO),
+    ]
+    .map(|(position, omega)| {
+        app.world_mut()
+            .spawn((
+                RigidBody::Dynamic,
+                Position(position),
+                Rotation::IDENTITY,
+                Mass(1.0),
+                AngularInertia::new(Vec3::splat(0.004)),
+                AngularVelocity(omega),
+                SleepingDisabled,
+            ))
+            .id()
+    });
+    app.world_mut()
+        .spawn(FixedJoint::new(bodies[0], bodies[1]).with_local_anchor1(Vec3::X));
+    for _ in 0..64 {
+        app.update();
+        let p1 = app.world().get::<Position>(bodies[0]).unwrap().0;
+        let p2 = app.world().get::<Position>(bodies[1]).unwrap().0;
+        let q1 = app.world().get::<Rotation>(bodies[0]).unwrap().0;
+        let q2 = app.world().get::<Rotation>(bodies[1]).unwrap().0;
+        let separation = (p1 + (q1 * Vec3::X).real() - p2).length();
+        let angle = q1.angle_between(q2);
+        assert!(
+            separation < 0.001 && angle < 0.001,
+            "fixed joint residual: separation={separation}, angle={angle}"
+        );
+    }
 }

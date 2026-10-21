@@ -296,7 +296,7 @@
 mod plugin;
 pub use plugin::{
     XpbdSolverPlugin, XpbdSolverSystems, XpbdVelocityProjection, prepare_xpbd_joint,
-    solve_xpbd_joint, warm_start_xpbd_motors,
+    solve_xpbd_joint,
 };
 
 pub mod joints;
@@ -369,26 +369,6 @@ pub trait XpbdConstraint<const ENTITY_COUNT: usize> {
         solver_data: &mut Self::SolverData,
         dt: f32,
     );
-
-    /// Warm starts the motor constraints by applying impulses from the previous frame.
-    ///
-    /// This is called once at the beginning of the first substep. After applying,
-    /// the stored warm start impulses should be zeroed to prevent re-application
-    /// in subsequent substeps.
-    ///
-    /// The `warm_start_coefficient` scales the applied impulse (typically 1.0).
-    ///
-    /// The default implementation does nothing.
-    #[allow(unused_variables)]
-    fn warm_start_motors(
-        &self,
-        bodies: [&mut SolverBody; ENTITY_COUNT],
-        inertias: [&SolverBodyInertia; ENTITY_COUNT],
-        solver_data: &mut Self::SolverData,
-        dt: f32,
-        warm_start_coefficient: f32,
-    ) {
-    }
 }
 
 /// Computes how much a constraint's [Lagrange multiplier](self#lagrange-multipliers) changes when projecting

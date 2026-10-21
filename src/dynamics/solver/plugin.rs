@@ -1103,7 +1103,7 @@ fn clear_joint_forces(mut joints: Query<&mut JointForces>) {
 #[allow(clippy::type_complexity)]
 pub fn joint_damping<T: Component + EntityConstraint<2>>(
     mut solver_bodies: ResMut<SolverBodies>,
-    index_query: Query<&SolverBodyIndex, Without<RigidBodyDisabled>>,
+    body_indices: Query<Option<&SolverBodyIndex>, (With<RigidBody>, Without<RigidBodyDisabled>)>,
     mut joints: Query<(&T, &JointDamping, Option<&mut JointForces>), Without<JointDisabled>>,
     time: Res<Time>,
     physics_time: Res<Time<Physics>>,
@@ -1118,16 +1118,13 @@ pub fn joint_damping<T: Component + EntityConstraint<2>>(
     for (joint, damping, forces) in &mut joints {
         let entities = joint.entities();
 
-        // Map the two jointed entities to their solver body indices, using an invalid index
-        // for static bodies without an associated solver body.
-        let index1 = index_query
-            .get(entities[0])
-            .copied()
-            .unwrap_or(SolverBodyIndex::INVALID);
-        let index2 = index_query
-            .get(entities[1])
-            .copied()
-            .unwrap_or(SolverBodyIndex::INVALID);
+        // Only present, enabled bodies participate. An enabled static body has
+        // no solver index, but a retired or disabled body is not a world anchor.
+        let Ok([index1, index2]) = body_indices.get_many(entities) else {
+            continue;
+        };
+        let index1 = index1.copied().unwrap_or(SolverBodyIndex::INVALID);
+        let index2 = index2.copied().unwrap_or(SolverBodyIndex::INVALID);
 
         if index1 == index2 {
             continue;

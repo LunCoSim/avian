@@ -1286,3 +1286,61 @@ fn rotating_fixed_joint_preserves_offset_and_orientation() {
         );
     }
 }
+
+#[cfg(feature = "3d")]
+#[test]
+fn disabled_body_does_not_become_a_fixed_joint_anchor_or_damping_sink() {
+    for angular in [false, true] {
+        let mut app = create_app();
+        app.finish();
+        let anchor = app
+            .world_mut()
+            .spawn((
+                RigidBody::Static,
+                RigidBodyDisabled,
+                Position(RVector::ZERO),
+            ))
+            .id();
+        let velocity = if angular { Vec3::ZERO } else { Vec3::X * 2.0 };
+        let spin = if angular { Vec3::Z * 2.0 } else { Vec3::ZERO };
+        let body = app
+            .world_mut()
+            .spawn((
+                RigidBody::Dynamic,
+                Position(RVector::X),
+                Mass(1.0),
+                AngularInertia::new(Vec3::ONE),
+                LinearVelocity(velocity),
+                AngularVelocity(spin),
+                SleepingDisabled,
+            ))
+            .id();
+        let joint = if angular {
+            app.world_mut()
+                .spawn((
+                    RevoluteJoint::new(anchor, body),
+                    JointDamping {
+                        linear: 0.0,
+                        angular: 20.0,
+                    },
+                    JointForces::default(),
+                ))
+                .id()
+        } else {
+            app.world_mut()
+                .spawn((
+                    FixedJoint::new(anchor, body).with_local_anchor1(Vec3::X),
+                    JointForces::default(),
+                ))
+                .id()
+        };
+        for _ in 0..3 {
+            app.update();
+        }
+        assert_eq!(app.world().get::<LinearVelocity>(body).unwrap().0, velocity);
+        assert_eq!(app.world().get::<AngularVelocity>(body).unwrap().0, spin);
+        let forces = app.world().get::<JointForces>(joint).unwrap();
+        assert_eq!(forces.force(), Vec3::ZERO);
+        assert_eq!(forces.torque(), Vec3::ZERO);
+    }
+}

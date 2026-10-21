@@ -149,7 +149,7 @@ pub fn solve_xpbd_joint<
     C: Component<Mutability = Mutable> + EntityConstraint<2> + XpbdConstraint<2>,
 >(
     mut solver_bodies: ResMut<SolverBodies>,
-    index_query: Query<&SolverBodyIndex, Without<RigidBodyDisabled>>,
+    body_indices: Query<Option<&SolverBodyIndex>, (With<RigidBody>, Without<RigidBodyDisabled>)>,
     mut joints: Query<(&mut C, &mut C::SolverData), (Without<RigidBody>, Without<JointDisabled>)>,
     time: Res<Time>,
 ) where
@@ -165,14 +165,11 @@ pub fn solve_xpbd_joint<
     for (mut joint, mut solver_data) in &mut joints {
         let [entity1, entity2] = joint.entities();
 
-        let index1 = index_query
-            .get(entity1)
-            .copied()
-            .unwrap_or(SolverBodyIndex::INVALID);
-        let index2 = index_query
-            .get(entity2)
-            .copied()
-            .unwrap_or(SolverBodyIndex::INVALID);
+        let Ok([index1, index2]) = body_indices.get_many([entity1, entity2]) else {
+            continue;
+        };
+        let index1 = index1.copied().unwrap_or(SolverBodyIndex::INVALID);
+        let index2 = index2.copied().unwrap_or(SolverBodyIndex::INVALID);
 
         if index1 == index2 {
             continue;

@@ -355,36 +355,41 @@ impl<C: AnyCollider> Plugin for ColliderTreeUpdatePlugin<C> {
             },
         );
 
-        // Case 10
-        app.add_observer(
-            |trigger: On<Insert<ActiveCollisionHooks>>,
-             mut collider_query: Query<
-                (&ColliderTreeProxyKey, Option<&ActiveCollisionHooks>),
-                Without<ColliderDisabled>,
-            >,
-             mut trees: ResMut<ColliderTrees>| {
-                let entity = trigger.entity;
-
-                let Ok((proxy_key, active_hooks)) = collider_query.get_mut(entity) else {
-                    return;
-                };
-
-                let tree = trees.tree_for_type_mut(proxy_key.tree_type());
-
-                // Update active hooks flags.
-                if let Some(proxy) = tree.get_proxy_mut(proxy_key.id()) {
-                    proxy.flags.set(
-                        ColliderTreeProxyFlags::CUSTOM_FILTER,
-                        active_hooks
-                            .is_some_and(|h| h.contains(ActiveCollisionHooks::FILTER_PAIRS)),
-                    );
-                }
-            },
-        );
+        // Case 10: All hook bits follow insertion and removal of their owner.
+        app.add_observer(set_active_hooks_on::<Insert<ActiveCollisionHooks>, false>);
+        app.add_observer(set_active_hooks_on::<Remove<ActiveCollisionHooks>, true>);
 
         // Case 11: Bevy removal observers run while the marker is still present.
         app.add_observer(set_body_disabled_on::<Add<RigidBodyDisabled>, true>);
         app.add_observer(set_body_disabled_on::<Remove<RigidBodyDisabled>, false>);
+    }
+}
+
+fn set_active_hooks_on<E: EventPattern<Event: EntityEvent>, const REMOVED: bool>(
+    trigger: On<E>,
+    colliders: Query<
+        (&ColliderTreeProxyKey, Option<&ActiveCollisionHooks>),
+        Without<ColliderDisabled>,
+    >,
+    mut trees: ResMut<ColliderTrees>,
+) {
+    let Ok((key, hooks)) = colliders.get(trigger.event_target()) else {
+        return;
+    };
+    let hooks = if REMOVED {
+        ActiveCollisionHooks::empty()
+    } else {
+        hooks.copied().unwrap_or_default()
+    };
+    if let Some(proxy) = trees.get_proxy_mut(*key) {
+        proxy.flags.set(
+            ColliderTreeProxyFlags::CUSTOM_FILTER,
+            hooks.contains(ActiveCollisionHooks::FILTER_PAIRS),
+        );
+        proxy.flags.set(
+            ColliderTreeProxyFlags::MODIFY_CONTACTS,
+            hooks.contains(ActiveCollisionHooks::MODIFY_CONTACTS),
+        );
     }
 }
 
@@ -1158,18 +1163,88 @@ mod tests {
             if disabled {
                 app.world_mut().entity_mut(body).insert(RigidBodyDisabled);
             } else {
-                app.world_mut().entity_mut(body).remove::<RigidBodyDisabled>();
+                app.world_mut()
+                    .entity_mut(body)
+                    .remove::<RigidBodyDisabled>();
             }
             app.world_mut().flush();
             for collider in colliders {
                 let key = *app.world().get::<ColliderTreeProxyKey>(collider).unwrap();
-                let proxy = app.world().resource::<ColliderTrees>().get_proxy(key).unwrap();
+                let proxy = app
+                    .world()
+                    .resource::<ColliderTrees>()
+                    .get_proxy(key)
+                    .unwrap();
                 assert_eq!(
                     proxy.flags.contains(ColliderTreeProxyFlags::BODY_DISABLED),
                     disabled
                 );
             }
         }
+    }
+
+    #[test]
+    fn active_hook_changes_update_both_proxy_bits() {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            TransformPlugin,
+            PhysicsPlugins::default(),
+            bevy::asset::AssetPlugin::default(),
+        ));
+        app.finish();
+        let collider = app
+            .world_mut()
+            .spawn((
+                RigidBody::Static,
+                Collider::sphere(0.5),
+                Transform::default(),
+            ))
+            .id();
+        app.update();
+        let key = *app.world().get::<ColliderTreeProxyKey>(collider).unwrap();
+        for hooks in [
+            ActiveCollisionHooks::MODIFY_CONTACTS,
+            ActiveCollisionHooks::FILTER_PAIRS,
+            ActiveCollisionHooks::FILTER_PAIRS | ActiveCollisionHooks::MODIFY_CONTACTS,
+            ActiveCollisionHooks::empty(),
+        ] {
+            app.world_mut().entity_mut(collider).insert(hooks);
+            app.world_mut().flush();
+            let proxy = app
+                .world()
+                .resource::<ColliderTrees>()
+                .get_proxy(key)
+                .unwrap();
+            assert_eq!(
+                proxy.flags.contains(ColliderTreeProxyFlags::CUSTOM_FILTER),
+                hooks.contains(ActiveCollisionHooks::FILTER_PAIRS)
+            );
+            assert_eq!(
+                proxy
+                    .flags
+                    .contains(ColliderTreeProxyFlags::MODIFY_CONTACTS),
+                hooks.contains(ActiveCollisionHooks::MODIFY_CONTACTS)
+            );
+        }
+        app.world_mut()
+            .entity_mut(collider)
+            .insert(ActiveCollisionHooks::FILTER_PAIRS | ActiveCollisionHooks::MODIFY_CONTACTS);
+        app.world_mut()
+            .entity_mut(collider)
+            .remove::<ActiveCollisionHooks>();
+        app.world_mut().flush();
+        let proxy = app
+            .world()
+            .resource::<ColliderTrees>()
+            .get_proxy(key)
+            .unwrap();
+        assert!(!proxy.flags.contains(ColliderTreeProxyFlags::CUSTOM_FILTER));
+        assert!(
+            !proxy
+                .flags
+                .contains(ColliderTreeProxyFlags::MODIFY_CONTACTS)
+        );
     }
 
     /// Removing a collider's rigid body (Case 3) moves its proxy to the

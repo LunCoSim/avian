@@ -275,9 +275,7 @@ fn query_tree(
             // Check if a joint disables contacts between the two bodies.
             if let Some(body1) = proxy1.body
                 && let Some(body2) = proxy2.body
-                && joint_graph
-                    .joints_between(body1, body2)
-                    .any(|edge| edge.collision_disabled)
+                && joint_graph.collisions_disabled_between(body1, body2)
             {
                 continue;
             }

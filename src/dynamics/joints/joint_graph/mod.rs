@@ -102,6 +102,12 @@ impl JointGraphEdge {
 }
 
 impl JointGraph {
+    /// Whether any joint between the bodies disables their mutual collision.
+    pub fn collisions_disabled_between(&self, body1: Entity, body2: Entity) -> bool {
+        self.joints_between(body1, body2)
+            .any(|edge| edge.collision_disabled)
+    }
+
     /// Returns a reference to the underlying [`StableUnGraph`].
     #[inline]
     pub fn graph(&self) -> &StableUnGraph<Entity, JointGraphEdge> {

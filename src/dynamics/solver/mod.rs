@@ -64,7 +64,7 @@ impl PluginGroup for SolverPlugins {
             .add(SolverSchedulePlugin)
             .add(IntegratorPlugin::default())
             .add(SolverPlugin::new_with_length_unit(self.length_unit))
-            .add(CcdPlugin)
+            .add(CcdPlugin::<()>::default())
             .add(IslandPlugin)
             .add(IslandSleepingPlugin)
             .add(JointGraphPlugin::<FixedJoint>::default())

@@ -862,6 +862,8 @@ where
         let builder = self
             .plugins
             .build()
+            .disable::<CcdPlugin>()
+            .add(CcdPlugin::<H>::default())
             .disable::<BvhBroadPhasePlugin>()
             .add(BvhBroadPhasePlugin::<H>::default());
 

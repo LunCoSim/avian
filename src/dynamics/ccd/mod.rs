@@ -224,11 +224,13 @@ use crate::{
     math::make_pose,
     utils::{MIN_PAR_ITER_ENTITIES, ParallelQueryForEach},
 };
+use bevy::ecs::system::SystemParamItem;
 #[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
-use bevy::ecs::query::QueryData;
+use bevy::ecs::{query::QueryData, system::StaticSystemParam};
 use bevy::prelude::*;
 #[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
 use core::cell::RefCell;
+use core::marker::PhantomData;
 #[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
 use dynamics::solver::SolverDiagnostics;
 #[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
@@ -243,9 +245,18 @@ use parry::query::{
 use thread_local::ThreadLocal;
 
 /// A plugin for [Continuous Collision Detection (CCD)](self).
-pub struct CcdPlugin;
+pub struct CcdPlugin<H: CollisionHooks = ()>(PhantomData<H>);
 
-impl Plugin for CcdPlugin {
+impl<H: CollisionHooks> Default for CcdPlugin<H> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<H: CollisionHooks + 'static> Plugin for CcdPlugin<H>
+where
+    for<'w, 's> SystemParamItem<'w, 's, H>: CollisionHooks,
+{
     #[cfg_attr(
         not(any(feature = "parry-f32", feature = "parry-f64")),
         expect(unused_variables)
@@ -258,7 +269,7 @@ impl Plugin for CcdPlugin {
             .expect("add PhysicsSchedule first");
 
         #[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
-        physics.add_systems(solve_continuous.in_set(SolverSystems::ContinuousCollision));
+        physics.add_systems(solve_continuous::<H>.in_set(SolverSystems::ContinuousCollision));
     }
 }
 
@@ -592,8 +603,14 @@ struct CcdImpact {
 /// If a time of impact is found, the body's accumulated motion is scaled down so it stops
 /// at the first impact, leaving the next frame's collision detection to resolve the contact.
 #[cfg(any(feature = "parry-f32", feature = "parry-f64"))]
-fn solve_continuous(
-    colliders: Query<(&Collider, &Position, &Rotation, Option<&CollisionLayers>)>,
+fn solve_continuous<H: CollisionHooks>(
+    colliders: Query<(
+        &Collider,
+        &Position,
+        &Rotation,
+        Option<&CollisionLayers>,
+        Option<&ActiveCollisionHooks>,
+    )>,
     ccd_query: Query<CcdBodyQuery>,
     mut bodies: ResMut<SolverBodies>,
     trees: Res<ColliderTrees>,
@@ -601,7 +618,13 @@ fn solve_continuous(
     time: Res<Time>,
     length_unit: Res<PhysicsLengthUnit>,
     mut diagnostics: ResMut<SolverDiagnostics>,
-) {
+    joint_graph: Res<crate::dynamics::joints::joint_graph::JointGraph>,
+    hooks: StaticSystemParam<H>,
+    par_commands: ParallelCommands,
+) where
+    for<'w, 's> SystemParamItem<'w, 's, H>: CollisionHooks,
+{
+    let hooks = hooks.into_inner();
     let start = crate::utils::Instant::now();
 
     let delta_secs = time.delta_secs();
@@ -636,253 +659,276 @@ fn solve_continuous(
     // as each fast body only reads the trees and produces its own deterministic result.
     // This combines parts of `b2FinalizeBodiesTask` and `b2SolveContinuous` from Box2D.
     ccd_query.par_for_each(MIN_PAR_ITER_ENTITIES, |fast| {
-        // Fetch the fast body's solver body state.
-        let Some(body) = bodies.get(*fast.index) else {
-            return;
-        };
-
-        // Only dynamic bodies support CCD.
-        if !body.flags.is_dynamic() {
-            return;
-        }
-
-        let ccd = fast.ccd.copied().unwrap_or_default();
-
-        if ccd.filter.is_empty() {
-            return;
-        }
-
-        let ccd_thickness = fast.size_metrics.ccd_thickness;
-        let sweep_radius = fast.size_metrics.sweep_radius;
-
-        // Compute the speed and displacement to determine whether the body moved
-        // enough to be considered a fast body that requires CCD.
-
-        // Linear and angular speed
-        let lin_speed = body.linear_velocity.length();
-        #[cfg(feature = "2d")]
-        let ang_speed = body.angular_velocity.abs();
-        #[cfg(feature = "3d")]
-        let ang_speed = body.angular_velocity.length();
-
-        // Displacement of the center of mass
-        let delta_pos_len = body.delta_position.length();
-
-        // The chord length of the rotation. This is a straight-line approximation
-        // of the displacement of the farthest point (per unit sweep radius).
-        let delta_rot_chord = body.delta_rotation.chord_length();
-
-        // The velocity of the farthest point on the body
-        let max_velocity = lin_speed + ang_speed * sweep_radius;
-
-        // The maximum distance the farthest point on the body travels during the timestep
-        let max_delta_position = delta_pos_len + delta_rot_chord * sweep_radius;
-
-        // The maximum of the two, which is an upper bound on how far any point on the body travels
-        let max_motion = max_delta_position.max(max_velocity * delta_secs);
-
-        // Check if the body moved more than the threshold fraction of its CCD thickness.
-        // CCD is only performed for bodies that are actually at risk of tunneling or deep overlap.
-        if max_motion <= ccd.threshold * ccd_thickness {
-            // Not a fast body, so no CCD is needed.
-            return;
-        }
-
-        // Records a fast body's time-of-impact fraction and earliest impact on the current thread.
-        let record = |fraction, impact| {
-            thread_local_results
-                .get_or(|| RefCell::new(Vec::new()))
-                .borrow_mut()
-                .push(CcdResult {
-                    index: *fast.index,
-                    fraction,
-                    impact,
-                });
-        };
-
-        let mode1 = ccd.mode;
-        let body_com_world = fast.position.0 + (fast.rotation * fast.com.0).real();
-
-        // Determine which trees to sweep against based on the body's filter.
-        let trees_to_query: [Option<&ColliderTree>; 4] = [
-            ccd.filter
-                .contains(CcdFilter::DYNAMIC)
-                .then_some(&trees.dynamic_tree),
-            ccd.filter
-                .contains(CcdFilter::KINEMATIC)
-                .then_some(&trees.kinematic_tree),
-            ccd.filter
-                .contains(CcdFilter::STATIC)
-                .then_some(&trees.static_tree),
-            ccd.filter
-                .contains(CcdFilter::STANDALONE)
-                .then_some(&trees.standalone_tree),
-        ];
-
-        // The smallest time of impact found across all of the body's colliders.
-        // Starts at the full timestep duration.
-        let mut min_toi = delta_secs;
-
-        // Details of the earliest impact found across all of the body's colliders.
-        let mut best_impact: Option<CcdImpact> = None;
-
-        // Sweep each collider attached to the body.
-        for collider_entity in fast.colliders {
-            let Ok((collider1, &collider_pos1, &collider_rot1, layers1)) =
-                colliders.get(collider_entity)
-            else {
-                continue;
+        par_commands.command_scope(|mut commands| {
+            // Fetch the fast body's solver body state.
+            let Some(body) = bodies.get(*fast.index) else {
+                return;
             };
 
-            let shape1 = collider1.shape_scaled().as_ref();
-
-            // No swept CCD for trimeshes, heightfields, polylines, or voxels.
-            if !crate::collision::collider::shape_supports_sweeps(shape1) {
-                continue;
+            // Only dynamic bodies support CCD.
+            if !body.flags.is_dynamic() {
+                return;
             }
 
-            let layers1 = layers1.copied().unwrap_or_default();
+            let ccd = fast.ccd.copied().unwrap_or_default();
 
-            let motion1 =
-                collider_sweep_motion(collider_pos1.0, collider_rot1, body_com_world, body, inv_dt);
+            if ccd.filter.is_empty() {
+                return;
+            }
 
-            // Compute the collider's end-of-frame pose to build the swept AABB.
-            let collider_rot2 = (body.delta_rotation * Rot::from(collider_rot1)).fast_renormalize();
-            let collider_pos2 = body_com_world
-                + body.delta_position.real()
-                + body.delta_rotation.real() * (collider_pos1.0 - body_com_world);
-            let swept_aabb = collider1.swept_aabb(
-                collider_pos1.0,
-                collider_rot1,
-                collider_pos2,
-                collider_rot2,
-                0.0,
-            );
-            let query_aabb = obvhs::aabb::Aabb::from(swept_aabb);
+            let ccd_thickness = fast.size_metrics.ccd_thickness;
+            let sweep_radius = fast.size_metrics.sweep_radius;
 
-            let fast_shape = CcdFastShape {
-                shape: shape1,
-                swept_aabb: parry::bounding_volume::Aabb::new(
-                    swept_aabb.min.real(),
-                    swept_aabb.max.real(),
-                ),
-                local_centroid: shape1.mass_properties(1.0).local_com,
-                min_extent: shape1.ccd_thickness(),
+            // Compute the speed and displacement to determine whether the body moved
+            // enough to be considered a fast body that requires CCD.
+
+            // Linear and angular speed
+            let lin_speed = body.linear_velocity.length();
+            #[cfg(feature = "2d")]
+            let ang_speed = body.angular_velocity.abs();
+            #[cfg(feature = "3d")]
+            let ang_speed = body.angular_velocity.length();
+
+            // Displacement of the center of mass
+            let delta_pos_len = body.delta_position.length();
+
+            // The chord length of the rotation. This is a straight-line approximation
+            // of the displacement of the farthest point (per unit sweep radius).
+            let delta_rot_chord = body.delta_rotation.chord_length();
+
+            // The velocity of the farthest point on the body
+            let max_velocity = lin_speed + ang_speed * sweep_radius;
+
+            // The maximum distance the farthest point on the body travels during the timestep
+            let max_delta_position = delta_pos_len + delta_rot_chord * sweep_radius;
+
+            // The maximum of the two, which is an upper bound on how far any point on the body travels
+            let max_motion = max_delta_position.max(max_velocity * delta_secs);
+
+            // Check if the body moved more than the threshold fraction of its CCD thickness.
+            // CCD is only performed for bodies that are actually at risk of tunneling or deep overlap.
+            if max_motion <= ccd.threshold * ccd_thickness {
+                // Not a fast body, so no CCD is needed.
+                return;
+            }
+
+            // Records a fast body's time-of-impact fraction and earliest impact on the current thread.
+            let record = |fraction, impact| {
+                thread_local_results
+                    .get_or(|| RefCell::new(Vec::new()))
+                    .borrow_mut()
+                    .push(CcdResult {
+                        index: *fast.index,
+                        fraction,
+                        impact,
+                    });
             };
 
-            // Sweep the collider against the relevant trees.
-            for tree in trees_to_query.into_iter().flatten() {
-                tree.aabb_traverse(query_aabb, |proxy_id| {
-                    let Some(proxy) = tree.get_proxy(proxy_id) else {
-                        return true;
-                    };
+            let mode1 = ccd.mode;
+            let body_com_world = fast.position.0 + (fast.rotation * fast.com.0).real();
 
-                    // Skip self-collisions within the same body.
-                    if proxy.body == Some(fast.entity) {
-                        return true;
-                    }
+            // Determine which trees to sweep against based on the body's filter.
+            let trees_to_query: [Option<&ColliderTree>; 4] = [
+                ccd.filter
+                    .contains(CcdFilter::DYNAMIC)
+                    .then_some(&trees.dynamic_tree),
+                ccd.filter
+                    .contains(CcdFilter::KINEMATIC)
+                    .then_some(&trees.kinematic_tree),
+                ccd.filter
+                    .contains(CcdFilter::STATIC)
+                    .then_some(&trees.static_tree),
+                ccd.filter
+                    .contains(CcdFilter::STANDALONE)
+                    .then_some(&trees.standalone_tree),
+            ];
 
-                    // Skip sensors and disabled bodies.
-                    if proxy.is_sensor()
-                        || proxy.flags.contains(ColliderTreeProxyFlags::BODY_DISABLED)
-                    {
-                        return true;
-                    }
+            // The smallest time of impact found across all of the body's colliders.
+            // Starts at the full timestep duration.
+            let mut min_toi = delta_secs;
 
-                    // Skip colliders with incompatible collision layers.
-                    if !layers1.interacts_with(proxy.layers) {
-                        return true;
-                    }
+            // Details of the earliest impact found across all of the body's colliders.
+            let mut best_impact: Option<CcdImpact> = None;
 
-                    let collider_entity2 = proxy.collider;
+            // Sweep each collider attached to the body.
+            for collider_entity in fast.colliders {
+                let Ok((collider1, &collider_pos1, &collider_rot1, layers1, active_hooks1)) =
+                    colliders.get(collider_entity)
+                else {
+                    continue;
+                };
 
-                    // If the narrow phase already has a touching contact for this pair,
-                    // the discrete contact solver is responsible for it.
-                    //
-                    // Skipping it here is important because clamping the body at the time of impact
-                    // would overwrite the already computed correction from the contact solver,
-                    // which could lead to the bodies getting frozen. This is not a problem in Box2D
-                    // because it runs CCD after updating body poses (but needs to store old poses).
-                    if contact_graph
-                        .get(collider_entity, collider_entity2)
-                        .is_some_and(|(_, pair)| pair.is_touching())
-                    {
-                        return true;
-                    }
+                let shape1 = collider1.shape_scaled().as_ref();
 
-                    // Fetch the target collider and its start-of-frame pose.
-                    let Ok((collider2, &target_pos, &target_rot, _)) =
-                        colliders.get(collider_entity2)
-                    else {
-                        return true;
-                    };
+                // No swept CCD for trimeshes, heightfields, polylines, or voxels.
+                if !crate::collision::collider::shape_supports_sweeps(shape1) {
+                    continue;
+                }
 
-                    // Reconstruct the target's motion over the timestep.
-                    // Bodies with a solver body are awake and moving, everything else is stationary.
-                    let (motion2, mode2) = match proxy.body {
-                        Some(body2_entity) => match ccd_query.get(body2_entity) {
-                            Ok(body2) => {
-                                if let Some(solver_body2) = bodies.get(*body2.index) {
-                                    let target_com_world =
-                                        body2.position.0 + (body2.rotation * body2.com.0).real();
-                                    (
-                                        collider_sweep_motion(
-                                            target_pos.0,
-                                            target_rot,
-                                            target_com_world,
-                                            solver_body2,
-                                            inv_dt,
-                                        ),
-                                        body2.ccd.map_or(SweepMode::NonLinear, |ccd| ccd.mode),
-                                    )
-                                } else {
+                let layers1 = layers1.copied().unwrap_or_default();
+
+                let motion1 = collider_sweep_motion(
+                    collider_pos1.0,
+                    collider_rot1,
+                    body_com_world,
+                    body,
+                    inv_dt,
+                );
+
+                // Compute the collider's end-of-frame pose to build the swept AABB.
+                let collider_rot2 =
+                    (body.delta_rotation * Rot::from(collider_rot1)).fast_renormalize();
+                let collider_pos2 = body_com_world
+                    + body.delta_position.real()
+                    + body.delta_rotation.real() * (collider_pos1.0 - body_com_world);
+                let swept_aabb = collider1.swept_aabb(
+                    collider_pos1.0,
+                    collider_rot1,
+                    collider_pos2,
+                    collider_rot2,
+                    0.0,
+                );
+                let query_aabb = obvhs::aabb::Aabb::from(swept_aabb);
+
+                let fast_shape = CcdFastShape {
+                    shape: shape1,
+                    swept_aabb: parry::bounding_volume::Aabb::new(
+                        swept_aabb.min.real(),
+                        swept_aabb.max.real(),
+                    ),
+                    local_centroid: shape1.mass_properties(1.0).local_com,
+                    min_extent: shape1.ccd_thickness(),
+                };
+
+                // Sweep the collider against the relevant trees.
+                for tree in trees_to_query.into_iter().flatten() {
+                    tree.aabb_traverse(query_aabb, |proxy_id| {
+                        let Some(proxy) = tree.get_proxy(proxy_id) else {
+                            return true;
+                        };
+
+                        // Skip self-collisions within the same body.
+                        if proxy.body == Some(fast.entity) {
+                            return true;
+                        }
+
+                        // Skip sensors and disabled bodies.
+                        if proxy.is_sensor()
+                            || proxy.flags.contains(ColliderTreeProxyFlags::BODY_DISABLED)
+                        {
+                            return true;
+                        }
+
+                        // Skip colliders with incompatible collision layers.
+                        if !layers1.interacts_with(proxy.layers) {
+                            return true;
+                        }
+
+                        let collider_entity2 = proxy.collider;
+                        if proxy.body.is_some_and(|body2| {
+                            joint_graph.collisions_disabled_between(fast.entity, body2)
+                        }) {
+                            return true;
+                        }
+                        if (active_hooks1.is_some_and(|active| {
+                            active.contains(ActiveCollisionHooks::FILTER_PAIRS)
+                        }) || proxy.flags.contains(ColliderTreeProxyFlags::CUSTOM_FILTER))
+                            && !hooks.filter_pairs(collider_entity, collider_entity2, &mut commands)
+                        {
+                            return true;
+                        }
+
+                        // If the narrow phase already has a touching contact for this pair,
+                        // the discrete contact solver is responsible for it.
+                        //
+                        // Skipping it here is important because clamping the body at the time of impact
+                        // would overwrite the already computed correction from the contact solver,
+                        // which could lead to the bodies getting frozen. This is not a problem in Box2D
+                        // because it runs CCD after updating body poses (but needs to store old poses).
+                        if contact_graph
+                            .get(collider_entity, collider_entity2)
+                            .is_some_and(|(_, pair)| pair.is_touching())
+                        {
+                            return true;
+                        }
+
+                        // Fetch the target collider and its start-of-frame pose.
+                        let Ok((collider2, &target_pos, &target_rot, _, _)) =
+                            colliders.get(collider_entity2)
+                        else {
+                            return true;
+                        };
+
+                        // Reconstruct the target's motion over the timestep.
+                        // Bodies with a solver body are awake and moving, everything else is stationary.
+                        let (motion2, mode2) = match proxy.body {
+                            Some(body2_entity) => match ccd_query.get(body2_entity) {
+                                Ok(body2) => {
+                                    if let Some(solver_body2) = bodies.get(*body2.index) {
+                                        let target_com_world = body2.position.0
+                                            + (body2.rotation * body2.com.0).real();
+                                        (
+                                            collider_sweep_motion(
+                                                target_pos.0,
+                                                target_rot,
+                                                target_com_world,
+                                                solver_body2,
+                                                inv_dt,
+                                            ),
+                                            body2.ccd.map_or(SweepMode::NonLinear, |ccd| ccd.mode),
+                                        )
+                                    } else {
+                                        (static_motion(target_pos.0, target_rot), SweepMode::Linear)
+                                    }
+                                }
+                                Err(_) => {
                                     (static_motion(target_pos.0, target_rot), SweepMode::Linear)
                                 }
-                            }
-                            Err(_) => (static_motion(target_pos.0, target_rot), SweepMode::Linear),
-                        },
-                        None => (static_motion(target_pos.0, target_rot), SweepMode::Linear),
-                    };
+                            },
+                            None => (static_motion(target_pos.0, target_rot), SweepMode::Linear),
+                        };
 
-                    // Use a non-linear sweep unless both bodies opt into linear sweeps.
-                    let sweep_mode = if mode1 == SweepMode::Linear && mode2 == SweepMode::Linear {
-                        SweepMode::Linear
-                    } else {
-                        SweepMode::NonLinear
-                    };
+                        // Use a non-linear sweep unless both bodies opt into linear sweeps.
+                        let sweep_mode = if mode1 == SweepMode::Linear && mode2 == SweepMode::Linear
+                        {
+                            SweepMode::Linear
+                        } else {
+                            SweepMode::NonLinear
+                        };
 
-                    // Compute the time of impact for this pair of colliders. If it's the earliest
-                    // so far, record the details needed to clamp the body's normal motion and hand
-                    // the contact off to the discrete solver next frame.
-                    if let Some(toi) = compute_ccd_toi(
-                        sweep_mode,
-                        &motion1,
-                        &fast_shape,
-                        &motion2,
-                        collider2.shape_scaled().as_ref(),
-                        min_toi,
-                        delta_secs,
-                        linear_slop,
-                    ) {
-                        min_toi = toi;
-                        best_impact = Some(CcdImpact {
-                            collider1: collider_entity,
-                            collider2: collider_entity2,
-                            // The additional speculative distance only needs to span the gap
-                            // the fast contact opens. The body's max travel is a safe upper bound
-                            // that the fast-body test already computed. The narrow phase has a more
-                            // elaborate velocity test that decides whether to actually keep the contact.
-                            distance: max_motion,
-                        });
-                    }
+                        // Compute the time of impact for this pair of colliders. If it's the earliest
+                        // so far, record the details needed to clamp the body's normal motion and hand
+                        // the contact off to the discrete solver next frame.
+                        if let Some(toi) = compute_ccd_toi(
+                            sweep_mode,
+                            &motion1,
+                            &fast_shape,
+                            &motion2,
+                            collider2.shape_scaled().as_ref(),
+                            min_toi,
+                            delta_secs,
+                            linear_slop,
+                        ) {
+                            min_toi = toi;
+                            best_impact = Some(CcdImpact {
+                                collider1: collider_entity,
+                                collider2: collider_entity2,
+                                // The additional speculative distance only needs to span the gap
+                                // the fast contact opens. The body's max travel is a safe upper bound
+                                // that the fast-body test already computed. The narrow phase has a more
+                                // elaborate velocity test that decides whether to actually keep the contact.
+                                distance: max_motion,
+                            });
+                        }
 
-                    true
-                });
+                        true
+                    });
+                }
             }
-        }
 
-        // Record the minimum time of impact as a fraction of the timestep.
-        record(min_toi * inv_dt, best_impact);
+            // Record the minimum time of impact as a fraction of the timestep.
+            record(min_toi * inv_dt, best_impact);
+        });
     });
 
     // Collect the per-thread results and sort them for determinism.

@@ -102,7 +102,7 @@ use bevy::{ecs::system::ReadOnlySystemParam, prelude::*};
 /// }
 /// ```
 ///
-/// This is equivalent to manually replacing the default [`BvhBroadPhasePlugin`] and [`NarrowPhasePlugin`]
+/// This is equivalent to manually replacing the default [`BvhBroadPhasePlugin`], [`NarrowPhasePlugin`], and [`CcdPlugin`]
 /// with instances that have the desired hooks provided using generics.
 ///
 /// [`SystemParam`]: bevy::ecs::system::SystemParam
@@ -148,10 +148,11 @@ pub trait CollisionHooks: ReadOnlySystemParam + Send + Sync {
     /// A contact pair filtering hook that determines whether contacts should be computed
     /// between `collider1` and `collider2`. If `false` is returned, contacts will not be computed.
     ///
-    /// This is called in the broad phase, before the [`ContactPair`] has been computed.
+    /// This is called by broad-phase and swept CCD pair queries before generating contacts.
+    /// A pair can be queried more than once; predicates must be deterministic.
     ///
     /// The provided [`Commands`] can be used for deferred ECS operations that run after
-    /// broad phase pairs have been found.
+    /// the querying collision system completes.
     ///
     /// # Notes
     ///

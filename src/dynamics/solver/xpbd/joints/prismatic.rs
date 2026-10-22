@@ -92,7 +92,7 @@ impl XpbdConstraint<2> for PrismaticJoint {
     ) {
         let [body1, body2] = bodies;
 
-        // Solve the angular constraint.
+        #[cfg(feature = "2d")]
         solver_data
             .angle_constraint
             .solve([body1, body2], inertias, self.angle_compliance, dt);
@@ -100,8 +100,10 @@ impl XpbdConstraint<2> for PrismaticJoint {
         // Solve motors before limits to give limits higher priority.
         self.apply_motor(body1, body2, inertias[0], inertias[1], solver_data, dt);
 
-        // Constrain the relative positions of the bodies, only allowing translation along one free axis.
+        #[cfg(feature = "2d")]
         self.constrain_positions(body1, body2, inertias[0], inertias[1], solver_data, dt);
+        #[cfg(feature = "3d")]
+        self.constrain_frames([body1, body2], inertias, solver_data, dt);
     }
 }
 
@@ -109,6 +111,7 @@ impl PrismaticJoint {
     /// Constrains the relative positions of the bodies, only allowing translation along one free axis.
     ///
     /// Returns the force exerted by this constraint.
+    #[cfg(feature = "2d")]
     fn constrain_positions(
         &self,
         body1: &mut SolverBody,
@@ -148,21 +151,6 @@ impl PrismaticJoint {
                 + solver_data.center_difference;
             delta_x += zero_distance_limit.compute_correction_along_axis(separation, axis2);
         }
-        #[cfg(feature = "3d")]
-        {
-            let axis2 = axis1.any_orthogonal_vector();
-            let axis3 = axis1.cross(axis2);
-
-            let separation = (body2.delta_position - body1.delta_position)
-                + (world_r2 - world_r1)
-                + solver_data.center_difference;
-            delta_x += zero_distance_limit.compute_correction_along_axis(separation, axis2);
-
-            let separation = (body2.delta_position - body1.delta_position)
-                + (world_r2 - world_r1)
-                + solver_data.center_difference;
-            delta_x += zero_distance_limit.compute_correction_along_axis(separation, axis3);
-        }
 
         let magnitude = delta_x.length();
 
@@ -198,6 +186,81 @@ impl PrismaticJoint {
         self.apply_positional_impulse(
             body1, body2, inertia1, inertia2, impulse, world_r1, world_r2,
         );
+    }
+}
+
+#[cfg(feature = "3d")]
+impl PrismaticJoint {
+    /// Couple orientation and anchor alignment so positional impulses cannot
+    /// reintroduce a locked rotation. The slider axis belongs to body 1's frame.
+    fn constrain_frames(
+        &self,
+        bodies: [&mut SolverBody; 2],
+        inertias: [&SolverBodyInertia; 2],
+        data: &mut PrismaticJointSolverData,
+        dt: f32,
+    ) {
+        let [body1, body2] = bodies;
+        let mut accumulated = [0.0_f64; 6];
+        let mut bound = None;
+        for _ in 0..3 {
+            let r1 = body1.delta_rotation * data.world_r1;
+            let r2 = body2.delta_rotation * data.world_r2;
+            let separation =
+                body2.delta_position - body1.delta_position + r2 - r1 + data.center_difference;
+            let axis = body1.delta_rotation * data.free_axis1;
+            let tangent = axis.any_orthonormal_vector();
+            let bitangent = axis.cross(tangent);
+            let angular_error = data
+                .angle_constraint
+                .error(body1.delta_rotation, body2.delta_rotation);
+            let slide = separation.dot(axis);
+            if let Some(limits) = self.limits {
+                if slide < limits.min {
+                    bound = Some((limits.min, [0.0, f64::INFINITY]));
+                } else if slide > limits.max {
+                    bound = Some((limits.max, [f64::NEG_INFINITY, 0.0]));
+                }
+            }
+            let mut rows = core::array::from_fn(|_| super::shared::ConstraintRow::default());
+            for (index, direction) in [tangent, bitangent, axis].into_iter().enumerate() {
+                if index == 2 && bound.is_none() {
+                    continue;
+                }
+                rows[index].linear1 = -direction;
+                rows[index].linear2 = direction;
+                // Differentiating the moving axis adds direction x separation.
+                rows[index].angular1 = direction.cross(r1 + separation);
+                rows[index].angular2 = r2.cross(direction);
+                rows[index].error = separation.dot(direction);
+                rows[index].compliance = self.align_compliance;
+                if index == 2 {
+                    let (limit, bounds) = bound.unwrap();
+                    rows[index].error -= limit;
+                    rows[index].compliance = self.limit_compliance;
+                    rows[index].bounds = bounds;
+                }
+            }
+            for (index, direction) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
+                rows[index + 3].angular1 = -direction;
+                rows[index + 3].angular2 = direction;
+                rows[index + 3].error = angular_error[index];
+                rows[index + 3].compliance = self.angle_compliance;
+            }
+            if rows.iter().all(|row| row.error.abs() < 1.0e-7) {
+                break;
+            }
+            let update = super::shared::solve_constraint_rows(
+                [body1, body2],
+                inertias,
+                &rows,
+                &mut accumulated,
+                dt,
+            );
+            data.total_position_lagrange -=
+                tangent * update[0] + bitangent * update[1] + axis * update[2];
+            data.angle_constraint.total_lagrange -= Vec3::new(update[3], update[4], update[5]);
+        }
     }
 }
 
@@ -281,3 +344,91 @@ impl PrismaticJoint {
 impl PositionConstraint for PrismaticJoint {}
 
 impl AngularConstraint for PrismaticJoint {}
+
+#[cfg(all(test, feature = "3d"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offset_slider_enforces_alignment_and_hard_stop_together() {
+        for axis in [Vec3::Y, Vec3::new(1.0, 2.0, 3.0).normalize()] {
+            let offset = Vec3::new(2.0, -1.0, 0.5);
+            let perpendicular = axis.any_orthonormal_vector();
+            let mut mobile = SolverBody::DUMMY;
+            mobile.delta_position = axis * 0.1 + perpendicular * 0.05;
+            let mut fixed = SolverBody::DUMMY;
+            let inertia = SolverBodyInertia::new(
+                0.001,
+                crate::math::SymmetricTensor::IDENTITY * 0.002,
+                LockedAxes::default(),
+                0,
+                true,
+            );
+            let mut data = PrismaticJointSolverData {
+                world_r1: offset,
+                center_difference: offset,
+                free_axis1: axis,
+                ..default()
+            };
+            let mut joint = PrismaticJoint::new(Entity::PLACEHOLDER, Entity::PLACEHOLDER)
+                .with_limits(-0.02, 0.02);
+            joint.solve(
+                [&mut mobile, &mut fixed],
+                [&inertia, &SolverBodyInertia::DUMMY],
+                &mut data,
+                1.0 / 480.0,
+            );
+            let residual = -mobile.delta_position - mobile.delta_rotation * offset + offset;
+            let slide = residual.dot(axis);
+            let cross_axis = (residual - slide * axis).length();
+            let angle = mobile.delta_rotation.angle_between(Quat::IDENTITY);
+            assert!(
+                cross_axis < 0.0002 && slide.abs() <= 0.0202 && angle < 0.0002,
+                "axis={axis}, cross_axis={cross_axis}, slide={slide}, angle={angle}"
+            );
+        }
+    }
+
+    #[test]
+    fn slider_preserves_free_motion_and_uses_independent_limit_compliance() {
+        let inertia = SolverBodyInertia::new(
+            1.0,
+            crate::math::SymmetricTensor::IDENTITY,
+            LockedAxes::default(),
+            0,
+            true,
+        );
+        for (slide, compliance, expected) in [
+            (0.01, 0.0, 0.01),
+            (-0.01, 0.0, -0.01),
+            (0.1, 0.0, 0.02),
+            (-0.1, 0.0, -0.02),
+            (0.1, 1.0, 0.06),
+            (-0.1, 1.0, -0.06),
+        ] {
+            let mut fixed = SolverBody::DUMMY;
+            let mut mobile = SolverBody::DUMMY;
+            mobile.delta_position = Vec3::Y * slide + Vec3::X * 0.03;
+            let mut data = PrismaticJointSolverData {
+                free_axis1: Vec3::Y,
+                ..default()
+            };
+            let mut joint = PrismaticJoint::new(Entity::PLACEHOLDER, Entity::PLACEHOLDER)
+                .with_limits(-0.02, 0.02)
+                .with_limit_compliance(compliance);
+            joint.solve(
+                [&mut fixed, &mut mobile],
+                [&SolverBodyInertia::DUMMY, &inertia],
+                &mut data,
+                1.0,
+            );
+            assert!(
+                (mobile.delta_position.y - expected).abs() < 1.0e-6,
+                "slide={slide}, compliance={compliance}, actual={:?}",
+                mobile.delta_position
+            );
+            assert!(mobile.delta_position.x.abs() < 1.0e-6);
+            assert_eq!(fixed.delta_position, Vec3::ZERO);
+        }
+    }
+}

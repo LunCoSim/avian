@@ -117,19 +117,8 @@ fn solve_fixed_block(
     dt: f32,
 ) {
     let [body1, body2] = bodies;
-    let [inertia1, inertia2] = inertias;
-    let m1 = inertia1.effective_inv_mass();
-    let m2 = inertia2.effective_inv_mass();
-    let i1 = inertia1.effective_inv_angular_inertia();
-    let i2 = inertia2.effective_inv_angular_inertia();
-    let alpha = [
-        f64::from(point_compliance) / f64::from(dt).powi(2),
-        f64::from(angle_compliance) / f64::from(dt).powi(2),
-    ];
-    let matrix_i1 = Mat3::from(i1).as_dmat3();
-    let matrix_i2 = Mat3::from(i2).as_dmat3();
     let mut accumulated = [0.0_f64; 6];
-    // Newton refinement accounts for the finite rotations applied to anchors.
+    // Newton refinement accounts for finite rotations of offset anchors.
     for _ in 0..3 {
         let r1 = body1.delta_rotation * data.point_constraint.world_r1;
         let r2 = body2.delta_rotation * data.point_constraint.world_r2;
@@ -141,59 +130,20 @@ fn solve_fixed_block(
         if separation == Vec3::ZERO && angular_error == Vec3::ZERO {
             break;
         }
-        let mut linear1 = [Vec3::ZERO; 6];
-        let mut linear2 = [Vec3::ZERO; 6];
-        let mut angular1 = [Vec3::ZERO; 6];
-        let mut angular2 = [Vec3::ZERO; 6];
-        let mut error = [0.0_f64; 6];
+        let mut rows = core::array::from_fn(|_| super::shared::ConstraintRow::default());
         for (index, axis) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
-            linear1[index] = -axis;
-            linear2[index] = axis;
-            angular1[index] = axis.cross(r1);
-            angular2[index] = r2.cross(axis);
-            angular1[index + 3] = -axis;
-            angular2[index + 3] = axis;
-            error[index] = f64::from(separation[index]);
-            error[index + 3] = f64::from(angular_error[index]);
+            rows[index].linear1 = -axis;
+            rows[index].linear2 = axis;
+            rows[index].angular1 = axis.cross(r1);
+            rows[index].angular2 = r2.cross(axis);
+            rows[index].error = separation[index];
+            rows[index].compliance = point_compliance;
+            rows[index + 3].angular1 = -axis;
+            rows[index + 3].angular2 = axis;
+            rows[index + 3].error = angular_error[index];
+            rows[index + 3].compliance = angle_compliance;
         }
-        let mut mass = [[0.0_f64; 6]; 6];
-        for row in 0..6 {
-            for col in 0..6 {
-                mass[row][col] = linear1[row]
-                    .as_dvec3()
-                    .dot(m1.as_dvec3() * linear1[col].as_dvec3())
-                    + linear2[row]
-                        .as_dvec3()
-                        .dot(m2.as_dvec3() * linear2[col].as_dvec3())
-                    + angular1[row]
-                        .as_dvec3()
-                        .dot(matrix_i1 * angular1[col].as_dvec3())
-                    + angular2[row]
-                        .as_dvec3()
-                        .dot(matrix_i2 * angular2[col].as_dvec3());
-            }
-            let compliance = alpha[row / 3];
-            mass[row][row] += compliance;
-            error[row] = -error[row] - compliance * accumulated[row];
-        }
-        let update = solve_mobile_rows(mass, error);
-        let mut p1 = Vec3::ZERO;
-        let mut p2 = Vec3::ZERO;
-        let mut a1 = Vec3::ZERO;
-        let mut a2 = Vec3::ZERO;
-        for row in 0..6 {
-            // Native solver coordinates and corrections are explicitly f32.
-            let impulse = update[row] as f32;
-            accumulated[row] += f64::from(impulse);
-            p1 += linear1[row] * impulse;
-            p2 += linear2[row] * impulse;
-            a1 += angular1[row] * impulse;
-            a2 += angular2[row] * impulse;
-        }
-        body1.delta_position += m1 * p1;
-        body2.delta_position += m2 * p2;
-        body1.delta_rotation = (Quat::from_scaled_axis(i1 * a1) * body1.delta_rotation).normalize();
-        body2.delta_rotation = (Quat::from_scaled_axis(i2 * a2) * body2.delta_rotation).normalize();
+        super::shared::solve_constraint_rows([body1, body2], inertias, &rows, &mut accumulated, dt);
     }
     data.point_constraint.total_lagrange -= Vec3::new(
         accumulated[0] as f32,
@@ -205,72 +155,4 @@ fn solve_fixed_block(
         accumulated[4] as f32,
         accumulated[5] as f32,
     );
-}
-
-// A rank-revealing symmetric elimination is required for valid locked axes.
-// glam_matrix_extras' 6x6 LDLT divides by zero for these semidefinite systems.
-// Null rows carry no mobility and therefore apply no physical correction.
-#[cfg(feature = "3d")]
-fn solve_mobile_rows(mut matrix: [[f64; 6]; 6], mut rhs: [f64; 6]) -> [f64; 6] {
-    let mut order = [0, 1, 2, 3, 4, 5];
-    let scale = (0..6).map(|i| matrix[i][i]).fold(0.0_f64, f64::max);
-    let tolerance = 64.0 * f64::EPSILON * scale;
-    let mut rank = 0;
-    for pivot in 0..6 {
-        let selected = (pivot..6)
-            .max_by(|&a, &b| matrix[a][a].total_cmp(&matrix[b][b]))
-            .unwrap();
-        if matrix[selected][selected] <= tolerance {
-            break;
-        }
-        matrix.swap(pivot, selected);
-        for row in &mut matrix {
-            row.swap(pivot, selected);
-        }
-        rhs.swap(pivot, selected);
-        order.swap(pivot, selected);
-        for row in pivot + 1..6 {
-            let factor = matrix[row][pivot] / matrix[pivot][pivot];
-            for col in pivot + 1..6 {
-                matrix[row][col] -= factor * matrix[pivot][col];
-            }
-            rhs[row] -= factor * rhs[pivot];
-            matrix[row][pivot] = 0.0;
-        }
-        rank += 1;
-    }
-    let mut result = [0.0; 6];
-    for row in (0..rank).rev() {
-        let tail: f64 = (row + 1..rank)
-            .map(|col| matrix[row][col] * result[order[col]])
-            .sum();
-        result[order[row]] = (rhs[row] - tail) / matrix[row][row];
-    }
-    result
-}
-
-#[cfg(all(test, feature = "3d"))]
-mod tests {
-    use super::solve_mobile_rows;
-
-    #[test]
-    fn fixed_block_solves_mobile_rows_without_actuating_locked_directions() {
-        let mut matrix = [[0.0; 6]; 6];
-        matrix[0][0] = 2.0;
-        matrix[2][2] = 4.0;
-        matrix[3][3] = 3.0;
-        matrix[0][3] = 1.0;
-        matrix[3][0] = 1.0;
-        let rhs = [3.0, 100.0, 8.0, 4.0, 200.0, 300.0];
-        let result = solve_mobile_rows(matrix, rhs);
-        assert_eq!([result[1], result[4], result[5]], [0.0; 3]);
-        for row in [0, 2, 3] {
-            let actual: f64 = (0..6).map(|col| matrix[row][col] * result[col]).sum();
-            assert!((actual - rhs[row]).abs() < 1e-12);
-        }
-        let dependent = [[1.0; 6]; 6];
-        let result = solve_mobile_rows(dependent, [6.0; 6]);
-        assert!(result.into_iter().all(f64::is_finite));
-        assert!((result.into_iter().sum::<f64>() - 6.0).abs() < 1e-12);
-    }
 }

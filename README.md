@@ -221,3 +221,17 @@ Avian is free and open source. All code in this repository is dual-licensed unde
 - Apache License, Version 2.0 ([LICENSE-APACHE](/LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
 
 at your option.
+
+### Constraint integration
+
+Native 3D fixed, revolute and prismatic frames are solved with contact support
+within the persistent physics island. Keep `IslandPlugin` installed with the
+3D XPBD solver. The same frame linearization serves isolated constraint calls.
+Prismatic travel stops have independent compliance and unilateral reaction
+bounds. Bounded active sets use native input precision and a finite work budget.
+
+`XpbdConstraint::solve` returns `Result<(), ConstraintSolveError>`. On rejection,
+`XpbdSolverStatus.failure` identifies the constraints and reason, physics pauses,
+and the native step does not publish solver-body deltas or completed forces.
+Hosts expose that failure and clear it only when retiring or rebuilding the
+scene. Custom constraints propagate their solve failures through this contract.

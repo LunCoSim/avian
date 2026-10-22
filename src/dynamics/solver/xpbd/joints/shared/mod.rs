@@ -7,4 +7,6 @@ pub use point_constraint::PointConstraintShared;
 #[cfg(feature = "3d")]
 mod constraint_rows;
 #[cfg(feature = "3d")]
-pub(super) use constraint_rows::{ConstraintRow, solve_constraint_rows};
+pub(super) use constraint_rows::{
+    ConstraintRow, point_rows, solve_bounded_rows, solve_constraint_rows,
+};

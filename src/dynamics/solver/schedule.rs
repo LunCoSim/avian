@@ -113,10 +113,10 @@ pub enum SolverSystems {
     ContinuousCollision,
     /// Writes back solver body data to rigid bodies.
     Finalize,
-    /// Copies contact impulses from [`ContactConstraints`] to the contacts in the [`ContactGraph`].
+    /// Copies contact impulses from the [`ConstraintGraph`] to the contacts in the [`ContactGraph`].
     /// They will be used for [warm starting](SubstepSolverSystems::WarmStart) the next frame or substep.
     ///
-    /// [`ContactConstraints`]: super::ContactConstraints
+    /// [`ConstraintGraph`]: super::constraint_graph::ConstraintGraph
     StoreContactImpulses,
 }
 
@@ -208,6 +208,9 @@ fn run_substep_schedule(world: &mut World) {
             trace!("running SubstepSchedule: {i}");
             *world.resource_mut::<Time>() = world.resource::<Time<Substeps>>().as_generic();
             schedule.run(world);
+            if world.resource::<Time<Physics>>().is_paused() {
+                break;
+            }
         }
     });
 

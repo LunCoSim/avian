@@ -59,7 +59,7 @@ impl XpbdConstraint<2> for DistanceJoint {
         inertias: [&SolverBodyInertia; 2],
         solver_data: &mut DistanceJointSolverData,
         dt: f32,
-    ) {
+    ) -> Result<(), ConstraintSolveError> {
         let [body1, body2] = bodies;
         let [inertia1, inertia2] = inertias;
 
@@ -81,7 +81,7 @@ impl XpbdConstraint<2> for DistanceJoint {
 
         if distance <= f32::EPSILON {
             // No separation, no need to apply a correction.
-            return;
+            return Ok(());
         }
 
         // Compute generalized inverse masses
@@ -110,6 +110,7 @@ impl XpbdConstraint<2> for DistanceJoint {
         self.apply_positional_impulse(
             body1, body2, inertia1, inertia2, impulse, world_r1, world_r2,
         );
+        Ok(())
     }
 }
 

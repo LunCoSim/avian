@@ -131,3 +131,8 @@ mod motor_tests {
         }
     }
 }
+
+#[cfg(feature = "3d")]
+mod islands;
+#[cfg(feature = "3d")]
+pub(crate) use islands::solve_joint_contact_islands;

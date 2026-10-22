@@ -113,32 +113,13 @@ impl XpbdConstraint<2> for RevoluteJoint {
         inertias: [&SolverBodyInertia; 2],
         solver_data: &mut RevoluteJointSolverData,
         dt: f32,
-    ) {
+    ) -> Result<(), ConstraintSolveError> {
         let [body1, body2] = bodies;
         let [inertia1, inertia2] = inertias;
 
         // Get the effective inverse angular inertia of the bodies.
         let inv_angular_inertia1 = inertia1.effective_inv_angular_inertia();
         let inv_angular_inertia2 = inertia2.effective_inv_angular_inertia();
-
-        #[cfg(feature = "3d")]
-        {
-            // Constrain the relative rotation of the bodies, only allowing rotation around one free axis
-            let a1 = body1.delta_rotation * solver_data.a1;
-            let a2 = body2.delta_rotation * solver_data.a2;
-            let difference = a1.cross(a2);
-
-            solver_data.total_align_lagrange += self.align_orientation(
-                body1,
-                body2,
-                inv_angular_inertia1,
-                inv_angular_inertia2,
-                difference,
-                0.0,
-                self.align_compliance,
-                dt,
-            );
-        }
 
         // Solve motors before limits to give limits higher priority.
         self.apply_motor(
@@ -150,25 +131,52 @@ impl XpbdConstraint<2> for RevoluteJoint {
             dt,
         );
 
-        // Apply angle limits when rotating around the free axis
-        self.apply_angle_limits(
-            body1,
-            body2,
-            inv_angular_inertia1,
-            inv_angular_inertia2,
-            solver_data,
-            dt,
-        );
-
-        // Align positions
-        solver_data
-            .point_constraint
-            .solve([body1, body2], inertias, self.point_compliance, dt);
+        #[cfg(feature = "2d")]
+        {
+            self.apply_angle_limits(
+                body1,
+                body2,
+                inv_angular_inertia1,
+                inv_angular_inertia2,
+                solver_data,
+                dt,
+            );
+            solver_data
+                .point_constraint
+                .solve([body1, body2], inertias, self.point_compliance, dt);
+        }
+        #[cfg(feature = "3d")]
+        {
+            let mut accumulated = [0.0; 6];
+            let mut bound = None;
+            for _ in 0..4 {
+                let rows = self.frame_rows(body1, body2, solver_data, &mut bound);
+                let update = super::shared::solve_constraint_rows(
+                    [body1, body2],
+                    inertias,
+                    &rows,
+                    &mut accumulated,
+                    dt,
+                )?;
+                for (index, row) in rows.iter().enumerate() {
+                    let impulse = update[index];
+                    if index < 3 {
+                        solver_data.point_constraint.total_lagrange -= row.linear2 * impulse;
+                    } else if index < 5 {
+                        solver_data.total_align_lagrange -= row.angular2 * impulse;
+                    } else {
+                        solver_data.total_limit_lagrange -= row.angular2 * impulse;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
 impl RevoluteJoint {
     /// Applies angle limits to limit the relative rotation of the bodies around the `hinge_axis`.
+    #[cfg(feature = "2d")]
     fn apply_angle_limits(
         &self,
         body1: &mut SolverBody,
@@ -184,14 +192,6 @@ impl RevoluteJoint {
                 let rotation_difference = solver_data.rotation_difference
                     + body1.delta_rotation.angle_to(body2.delta_rotation);
                 angle_limit.compute_correction(rotation_difference, PI)
-            }
-            #[cfg(feature = "3d")]
-            {
-                // [n, n1, n2] = [a1, b1, b2], where [a, b, c] are perpendicular unit axes on the bodies.
-                let a1 = body1.delta_rotation * solver_data.a1;
-                let b1 = body1.delta_rotation * solver_data.b1;
-                let b2 = body2.delta_rotation * solver_data.b2;
-                angle_limit.compute_correction(a1, b1, b2, PI)
             }
         }) else {
             return;
@@ -212,7 +212,7 @@ impl RevoluteJoint {
     /// Applies motor forces to drive the joint towards the target velocity and/or position.
     ///
     /// Uses a PD controller approach with optional implicit Euler integration improved stability.
-    fn apply_motor(
+    pub(super) fn apply_motor(
         &self,
         body1: &mut SolverBody,
         body2: &mut SolverBody,
@@ -309,3 +309,57 @@ impl RevoluteJoint {
 impl PositionConstraint for RevoluteJoint {}
 
 impl AngularConstraint for RevoluteJoint {}
+
+#[cfg(feature = "3d")]
+impl RevoluteJoint {
+    pub(super) fn frame_rows(
+        &self,
+        body1: &SolverBody,
+        body2: &SolverBody,
+        data: &RevoluteJointSolverData,
+        bound: &mut Option<(f32, [f64; 2])>,
+    ) -> [super::shared::ConstraintRow; 6] {
+        let r1 = body1.delta_rotation * data.point_constraint.world_r1;
+        let r2 = body2.delta_rotation * data.point_constraint.world_r2;
+        let separation = body2.delta_position - body1.delta_position + r2 - r1
+            + data.point_constraint.center_difference;
+        let a1 = body1.delta_rotation * data.a1;
+        let a2 = body2.delta_rotation * data.a2;
+        let tangent = a1.any_orthonormal_vector();
+        let bitangent = a1.cross(tangent);
+        let error = Quat::from_rotation_arc(a1, a2).to_scaled_axis();
+        let mut points =
+            super::shared::point_rows(r1, r2, separation, self.point_compliance).into_iter();
+        let mut rows = core::array::from_fn(|index| {
+            if index < 3 {
+                points.next().unwrap()
+            } else {
+                super::shared::ConstraintRow::default()
+            }
+        });
+        for (index, axis) in [tangent, bitangent].into_iter().enumerate() {
+            rows[index + 3].angular1 = -axis;
+            rows[index + 3].angular2 = axis;
+            rows[index + 3].error = error.dot(axis);
+            rows[index + 3].compliance = self.align_compliance;
+        }
+        let b1 = body1.delta_rotation * data.b1;
+        let b2 = body2.delta_rotation * data.b2;
+        let angle = b1.cross(b2).dot(a1).atan2(b1.dot(b2));
+        if let Some(limits) = self.angle_limit {
+            if angle < limits.min {
+                *bound = Some((limits.min, [0.0, f64::INFINITY]));
+            } else if angle > limits.max {
+                *bound = Some((limits.max, [f64::NEG_INFINITY, 0.0]));
+            }
+        }
+        if let Some((limit, bounds)) = *bound {
+            rows[5].angular1 = -a1;
+            rows[5].angular2 = a1;
+            rows[5].error = angle - limit;
+            rows[5].compliance = self.limit_compliance;
+            rows[5].bounds = bounds;
+        }
+        rows
+    }
+}

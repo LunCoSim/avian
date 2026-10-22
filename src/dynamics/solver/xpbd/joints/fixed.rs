@@ -76,7 +76,7 @@ impl XpbdConstraint<2> for FixedJoint {
         inertias: [&SolverBodyInertia; 2],
         solver_data: &mut FixedJointSolverData,
         dt: f32,
-    ) {
+    ) -> Result<(), ConstraintSolveError> {
         let [body1, body2] = bodies;
 
         #[cfg(feature = "2d")]
@@ -96,7 +96,8 @@ impl XpbdConstraint<2> for FixedJoint {
             self.point_compliance,
             self.angle_compliance,
             dt,
-        );
+        )?;
+        Ok(())
     }
 }
 
@@ -115,7 +116,7 @@ fn solve_fixed_block(
     point_compliance: f32,
     angle_compliance: f32,
     dt: f32,
-) {
+) -> Result<(), ConstraintSolveError> {
     let [body1, body2] = bodies;
     let mut accumulated = [0.0_f64; 6];
     // Newton refinement accounts for finite rotations of offset anchors.
@@ -130,20 +131,14 @@ fn solve_fixed_block(
         if separation == Vec3::ZERO && angular_error == Vec3::ZERO {
             break;
         }
-        let mut rows = core::array::from_fn(|_| super::shared::ConstraintRow::default());
-        for (index, axis) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
-            rows[index].linear1 = -axis;
-            rows[index].linear2 = axis;
-            rows[index].angular1 = axis.cross(r1);
-            rows[index].angular2 = r2.cross(axis);
-            rows[index].error = separation[index];
-            rows[index].compliance = point_compliance;
-            rows[index + 3].angular1 = -axis;
-            rows[index + 3].angular2 = axis;
-            rows[index + 3].error = angular_error[index];
-            rows[index + 3].compliance = angle_compliance;
-        }
-        super::shared::solve_constraint_rows([body1, body2], inertias, &rows, &mut accumulated, dt);
+        let rows = frame_rows(body1, body2, data, point_compliance, angle_compliance);
+        super::shared::solve_constraint_rows(
+            [body1, body2],
+            inertias,
+            &rows,
+            &mut accumulated,
+            dt,
+        )?;
     }
     data.point_constraint.total_lagrange -= Vec3::new(
         accumulated[0] as f32,
@@ -155,4 +150,37 @@ fn solve_fixed_block(
         accumulated[4] as f32,
         accumulated[5] as f32,
     );
+    Ok(())
+}
+
+#[cfg(feature = "3d")]
+pub(super) fn frame_rows(
+    body1: &SolverBody,
+    body2: &SolverBody,
+    data: &FixedJointSolverData,
+    point_compliance: f32,
+    angle_compliance: f32,
+) -> [super::shared::ConstraintRow; 6] {
+    let r1 = body1.delta_rotation * data.point_constraint.world_r1;
+    let r2 = body2.delta_rotation * data.point_constraint.world_r2;
+    let separation = body2.delta_position - body1.delta_position + r2 - r1
+        + data.point_constraint.center_difference;
+    let angular_error = data
+        .angle_constraint
+        .error(body1.delta_rotation, body2.delta_rotation);
+    let mut points = super::shared::point_rows(r1, r2, separation, point_compliance).into_iter();
+    core::array::from_fn(|index| {
+        if index < 3 {
+            points.next().unwrap()
+        } else {
+            let axis = [Vec3::X, Vec3::Y, Vec3::Z][index - 3];
+            super::shared::ConstraintRow {
+                angular1: -axis,
+                angular2: axis,
+                error: angular_error[index - 3],
+                compliance: angle_compliance,
+                ..default()
+            }
+        }
+    })
 }

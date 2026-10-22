@@ -115,7 +115,7 @@ impl XpbdConstraint<2> for CenterDistanceConstraint {
         inertias: [&SolverBodyInertia; 2],
         solver_data: &mut CenterDistanceConstraintSolverData,
         dt: f32,
-    ) {
+    ) -> Result<(), ConstraintSolveError> {
         let [body1, body2] = bodies;
         let [inertia1, inertia2] = inertias;
 
@@ -139,7 +139,7 @@ impl XpbdConstraint<2> for CenterDistanceConstraint {
 
         // Avoid division by zero and unnecessary computation.
         if distance <= 0.0 || c == 0.0 {
-            return;
+            return Ok(());
         }
 
         // The opposite of the normalized center difference.
@@ -177,6 +177,7 @@ impl XpbdConstraint<2> for CenterDistanceConstraint {
 
         // Apply the positional correction (method from PositionConstraint).
         self.apply_positional_impulse(body1, body2, inertia1, inertia2, impulse, r1, r2);
+        Ok(())
     }
 }
 

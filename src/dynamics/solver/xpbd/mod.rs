@@ -55,11 +55,11 @@
 //! ```
 #![cfg_attr(
     feature = "2d",
-    doc = "# use avian2d::{dynamics::{joints::EntityConstraint, solver::{solver_body::{SolverBody, SolverBodyInertia}, xpbd::{XpbdConstraint, XpbdConstraintSolverData}}}, math::RVector, prelude::*};"
+    doc = "# use avian2d::{dynamics::{joints::EntityConstraint, solver::{solver_body::{SolverBody, SolverBodyInertia}, xpbd::{ConstraintSolveError, XpbdConstraint, XpbdConstraintSolverData}}}, math::RVector, prelude::*};"
 )]
 #![cfg_attr(
     feature = "3d",
-    doc = "# use avian3d::{dynamics::{joints::EntityConstraint, solver::{solver_body::{SolverBody, SolverBodyInertia}, xpbd::{XpbdConstraint, XpbdConstraintSolverData}}}, math::RVector, prelude::*};"
+    doc = "# use avian3d::{dynamics::{joints::EntityConstraint, solver::{solver_body::{SolverBody, SolverBodyInertia}, xpbd::{ConstraintSolveError, XpbdConstraint, XpbdConstraintSolverData}}}, math::RVector, prelude::*};"
 )]
 //! # use bevy::{ecs::entity::{EntityMapper, MapEntities}, prelude::*};
 //! #
@@ -118,10 +118,11 @@
 //!         inertias: [&SolverBodyInertia; 2],
 //!         solver_data: &mut CustomConstraintSolverData,
 //!         dt: f32,
-//!     ) {
+//!     ) -> Result<(), ConstraintSolveError> {
 //!         // Solve the constraint by applying corrections to the `delta_position`
 //!         // and `delta_rotation` of the participating bodies.
 //!         // This runs at each substep.
+//!         Ok(())
 //!     }
 //! }
 //!
@@ -308,8 +309,76 @@ pub use angular_constraint::AngularConstraint;
 pub use positional_constraint::PositionConstraint;
 
 use crate::prelude::*;
+use bevy::{ecs::reflect::ReflectResource, reflect::std_traits::ReflectDefault};
 
 use super::solver_body::{SolverBody, SolverBodyInertia};
+
+/// A native constraint solve that cannot produce a finite, bounded result.
+#[derive(Clone, Debug, PartialEq, Eq, bevy::prelude::Reflect)]
+pub enum ConstraintSolveError {
+    /// The linearized system has a non-finite coefficient or residual.
+    NonFiniteSystem,
+    /// The nonlinear frame solve exhausted its refinement budget.
+    NonlinearIterationLimit {
+        /// Number of refinements applied.
+        iterations: usize,
+    },
+    /// A correction cannot be represented in the native solver state.
+    NonFiniteCorrection,
+    /// The bounded active set exhausted its dimension-dependent work budget.
+    ActiveSetIterationLimit {
+        /// Number of scalar constraint rows.
+        dimension: usize,
+        /// Number of active-set iterations attempted.
+        iterations: usize,
+    },
+}
+impl core::fmt::Display for ConstraintSolveError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NonFiniteSystem => f.write_str("constraint system contains non-finite values"),
+            Self::NonlinearIterationLimit { iterations } => write!(
+                f,
+                "constraint residual exceeds native tolerance after {iterations} refinements"
+            ),
+            Self::NonFiniteCorrection => {
+                f.write_str("constraint correction exceeds native solver precision")
+            }
+            Self::ActiveSetIterationLimit {
+                dimension,
+                iterations,
+            } => write!(
+                f,
+                "{dimension}-row active set did not converge within {iterations} iterations"
+            ),
+        }
+    }
+}
+/// A terminal failure of the current native integration transaction.
+#[derive(Clone, Debug, bevy::prelude::Reflect)]
+pub struct ConstraintSolveFailure {
+    /// Constraints participating in the rejected solve.
+    pub constraints: Vec<bevy::prelude::Entity>,
+    /// The native reason for rejecting the solve.
+    pub reason: ConstraintSolveError,
+}
+/// A failed native step must not publish solver-body deltas or completed forces.
+/// The host clears this status only when it retires or explicitly rebuilds the scene.
+#[derive(Default, bevy::prelude::Resource, bevy::prelude::Reflect)]
+#[reflect(Resource, Default)]
+pub struct XpbdSolverStatus {
+    /// Terminal failure; no subsequent native integration is admitted.
+    pub failure: Option<ConstraintSolveFailure>,
+}
+impl XpbdSolverStatus {
+    /// Retire the failure when the host rebuilds the scene.
+    pub fn clear(&mut self) {
+        self.failure = None;
+    }
+}
+pub(crate) fn xpbd_solver_healthy(status: bevy::prelude::Res<XpbdSolverStatus>) -> bool {
+    status.failure.is_none()
+}
 
 /// A trait for additional data required for solving an XPBD constraint.
 pub trait XpbdConstraintSolverData {
@@ -344,7 +413,8 @@ pub trait XpbdConstraint<const ENTITY_COUNT: usize> {
         solver_data: &mut Self::SolverData,
     );
 
-    /// Solves the constraint.
+    /// Solves the constraint, rejecting an invalid or non-convergent result.
+    /// A rejection pauses physics and prevents publication of this step.
     ///
     /// There are two main steps to solving a constraint:
     ///
@@ -368,7 +438,7 @@ pub trait XpbdConstraint<const ENTITY_COUNT: usize> {
         inertias: [&SolverBodyInertia; ENTITY_COUNT],
         solver_data: &mut Self::SolverData,
         dt: f32,
-    );
+    ) -> Result<(), ConstraintSolveError>;
 }
 
 /// Computes how much a constraint's [Lagrange multiplier](self#lagrange-multipliers) changes when projecting

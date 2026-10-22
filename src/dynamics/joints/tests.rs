@@ -7,6 +7,9 @@ use crate::prelude::*;
 
 const TIMESTEP: f32 = 1.0 / 64.0;
 
+#[derive(Resource)]
+struct ExpectedConstraintFailure;
+
 fn create_app() -> App {
     let mut app = App::new();
     app.add_plugins((
@@ -31,7 +34,126 @@ fn create_app() -> App {
         TIMESTEP,
     )));
 
+    app.add_systems(
+        Last,
+        |status: Res<crate::dynamics::solver::xpbd::XpbdSolverStatus>,
+         expected: Option<Res<ExpectedConstraintFailure>>| {
+            assert!(
+                expected.is_some() || status.failure.is_none(),
+                "unexpected native constraint failure: {:?}",
+                status.failure
+            );
+        },
+    );
+
     app
+}
+
+#[cfg(feature = "3d")]
+#[test]
+fn loaded_slider_impact_preserves_contact_and_travel() {
+    use crate::math::ToF32Precision;
+    for (ground_kind, ground_speed) in [(RigidBody::Static, 0.0), (RigidBody::Kinematic, 0.2)] {
+        let mut app = create_app();
+        app.insert_resource(SubstepCount(8));
+        app.insert_resource(Gravity(Vec3::NEG_Y * 1.62));
+        app.finish();
+        let ground = app
+            .world_mut()
+            .spawn((
+                ground_kind,
+                Position(RVector::NEG_Y * 0.5),
+                Collider::cuboid(8.0, 1.0, 8.0),
+                LinearVelocity(Vec3::Y * ground_speed),
+            ))
+            .id();
+        let hull = app
+            .world_mut()
+            .spawn((
+                RigidBody::Dynamic,
+                Position(RVector::Y * 2.3),
+                Mass(4000.0),
+                AngularInertia::new(Vec3::splat(7000.0)),
+                LinearVelocity(Vec3::NEG_Y * 6.0),
+            ))
+            .id();
+        let foot = app
+            .world_mut()
+            .spawn((
+                RigidBody::Dynamic,
+                Position(RVector::Y * 0.3),
+                Mass(180.0),
+                AngularInertia::new(Vec3::splat(10.0)),
+                Collider::cuboid(0.6, 0.2, 0.6),
+                LinearVelocity(Vec3::NEG_Y * 6.0),
+                SpeculativeCcd::MAX,
+                SweptCcd::default().with_filter(CcdFilter::ALL),
+            ))
+            .id();
+        app.world_mut().spawn(
+            PrismaticJoint::new(hull, foot)
+                .with_slider_axis(Vec3::Y)
+                .with_local_anchor1(Vec3::NEG_Y * 2.0)
+                .with_limits(-0.05, 0.02)
+                .with_motor(LinearMotor {
+                    max_force: 12000.0,
+                    motor_model: MotorModel::ForceBased {
+                        stiffness: 85000.0,
+                        damping: 19000.0,
+                    },
+                    ..default()
+                }),
+        );
+        let mut penetration: f64 = 0.0;
+        let mut travel_error: f64 = 0.0;
+        let mut worst = None;
+        for tick in 0..128 {
+            app.update();
+            let hull_position = app.world().get::<Position>(hull).unwrap().0;
+            let foot_position = app.world().get::<Position>(foot).unwrap().0;
+            let hull_rotation = app.world().get::<Rotation>(hull).unwrap().0;
+            let foot_rotation = app.world().get::<Rotation>(foot).unwrap().0;
+            let relative =
+                (foot_position - hull_position).f32() - hull_rotation * (Vec3::NEG_Y * 2.0);
+            let slide = f64::from(relative.dot(hull_rotation * Vec3::Y));
+            for x in [-0.3, 0.3] {
+                for y in [-0.1, 0.1] {
+                    for z in [-0.3, 0.3] {
+                        let corner_y = foot_position.y as f64
+                            + f64::from((foot_rotation * Vec3::new(x, y, z)).y);
+                        let ground_y =
+                            app.world().get::<Position>(ground).unwrap().0.y as f64 + 0.5;
+                        penetration = penetration.max(ground_y - corner_y);
+                    }
+                }
+            }
+            let error = (-0.05 - slide).max(slide - 0.02);
+            if error > travel_error {
+                travel_error = error;
+                let index = *app
+                    .world()
+                    .get::<crate::dynamics::solver::solver_body::SolverBodyIndex>(foot)
+                    .unwrap();
+                worst = Some((
+                    tick,
+                    slide,
+                    app.world()
+                        .resource::<crate::dynamics::solver::solver_body::SolverBodies>()
+                        .get(index)
+                        .unwrap()
+                        .flags,
+                ));
+            }
+        }
+        assert!(
+            penetration <= 0.001 && travel_error <= 0.001,
+            "ground={ground_kind:?}, penetration={penetration}, travel_error={travel_error}, worst={worst:?}"
+        );
+        assert_eq!(
+            app.world().get::<LinearVelocity>(ground).unwrap().0,
+            Vec3::Y * ground_speed
+        );
+    }
 }
 
 /// Tests that an angular motor on a revolute joint spins the attached body.
@@ -1343,4 +1465,88 @@ fn disabled_body_does_not_become_a_fixed_joint_anchor_or_damping_sink() {
         assert_eq!(forces.force(), Vec3::ZERO);
         assert_eq!(forces.torque(), Vec3::ZERO);
     }
+}
+
+#[cfg(feature = "3d")]
+#[test]
+fn rejected_constraint_does_not_publish_partial_native_integration() {
+    use crate::dynamics::{
+        joints::EntityConstraint,
+        solver::{
+            solver_body::{SolverBody, SolverBodyInertia},
+            xpbd::{
+                ConstraintSolveError, XpbdConstraint, XpbdConstraintSolverData, XpbdSolverStatus,
+                XpbdSolverSystems, solve_xpbd_joint,
+            },
+        },
+    };
+    use bevy::ecs::entity::{EntityMapper, MapEntities};
+    #[derive(Component)]
+    struct RejectingConstraint([Entity; 2]);
+    impl MapEntities for RejectingConstraint {
+        fn map_entities<M: EntityMapper>(&mut self, mapper: &mut M) {
+            self.0 = self.0.map(|entity| mapper.get_mapped(entity));
+        }
+    }
+    impl EntityConstraint<2> for RejectingConstraint {
+        fn entities(&self) -> [Entity; 2] {
+            self.0
+        }
+    }
+    #[derive(Component, Default)]
+    struct Data;
+    impl XpbdConstraintSolverData for Data {}
+    impl XpbdConstraint<2> for RejectingConstraint {
+        type SolverData = Data;
+        fn prepare(&mut self, _: [&RigidBodyQueryReadOnlyItem; 2], _: &mut Data) {}
+        fn solve(
+            &mut self,
+            bodies: [&mut SolverBody; 2],
+            _: [&SolverBodyInertia; 2],
+            _: &mut Data,
+            _: f32,
+        ) -> Result<(), ConstraintSolveError> {
+            bodies[0].delta_position = Vec3::splat(42.0);
+            Err(ConstraintSolveError::NonFiniteSystem)
+        }
+    }
+    let mut app = create_app();
+    app.insert_resource(ExpectedConstraintFailure);
+    app.add_systems(
+        SubstepSchedule,
+        solve_xpbd_joint::<RejectingConstraint>.in_set(XpbdSolverSystems::SolveUserConstraints),
+    );
+    app.finish();
+    let mobile = app
+        .world_mut()
+        .spawn((
+            RigidBody::Dynamic,
+            Position(RVector::Y),
+            LinearVelocity(Vec3::X),
+            Mass(1.0),
+            AngularInertia::new(Vec3::ONE),
+        ))
+        .id();
+    let anchor = app.world_mut().spawn(RigidBody::Static).id();
+    let constraint = app
+        .world_mut()
+        .spawn((RejectingConstraint([mobile, anchor]), Data))
+        .id();
+    for _ in 0..4 {
+        app.update();
+    }
+    let failure = app
+        .world()
+        .resource::<XpbdSolverStatus>()
+        .failure
+        .as_ref()
+        .unwrap();
+    assert_eq!(failure.constraints, vec![constraint]);
+    assert_eq!(failure.reason, ConstraintSolveError::NonFiniteSystem);
+    assert!(app.world().resource::<Time<Physics>>().is_paused());
+    assert_eq!(app.world().get::<Position>(mobile).unwrap().0, RVector::Y);
+    assert_eq!(
+        app.world().get::<LinearVelocity>(mobile).unwrap().0,
+        Vec3::X
+    );
 }

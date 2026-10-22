@@ -89,7 +89,7 @@ impl XpbdConstraint<2> for SphericalJoint {
         inertias: [&SolverBodyInertia; 2],
         solver_data: &mut SphericalJointSolverData,
         dt: f32,
-    ) {
+    ) -> Result<(), ConstraintSolveError> {
         let [body1, body2] = bodies;
         let [inertia1, inertia2] = inertias;
 
@@ -106,6 +106,7 @@ impl XpbdConstraint<2> for SphericalJoint {
 
         // Apply twist limits
         self.apply_twist_limits(body1, body2, inertia1, inertia2, solver_data, dt);
+        Ok(())
     }
 }
 

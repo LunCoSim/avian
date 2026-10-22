@@ -9,7 +9,8 @@
 //! Islands are only used for sleeping and waking. Solver parallelism is achieved with [graph coloring](super::constraint_graph)
 //! using the [`ConstraintGraph`](super::constraint_graph::ConstraintGraph).
 //!
-//! If simulation islands are not needed, the [`IslandPlugin`] can be omitted.
+//! Native 3D XPBD assemblies use this connectivity for coupled joint/contact
+//! solving. Keep [`IslandPlugin`] installed when using that solver.
 //!
 //! # References
 //!

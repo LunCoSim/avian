@@ -1,3 +1,4 @@
+use super::{ConstraintSolveFailure, XpbdSolverStatus};
 use core::cmp::Ordering;
 
 use super::joints::*;
@@ -20,6 +21,23 @@ pub struct XpbdSolverPlugin;
 impl Plugin for XpbdSolverPlugin {
     fn build(&self, app: &mut App) {
         app.register_type::<XpbdVelocityProjection>();
+        app.init_resource::<XpbdSolverStatus>()
+            .register_type::<XpbdSolverStatus>();
+        for set in [
+            SolverSystems::PostSubstep,
+            SolverSystems::Restitution,
+            SolverSystems::ContinuousCollision,
+            SolverSystems::Finalize,
+            SolverSystems::StoreContactImpulses,
+        ] {
+            app.configure_sets(PhysicsSchedule, set.run_if(super::xpbd_solver_healthy));
+        }
+        app.configure_sets(
+            SubstepSchedule,
+            XpbdSolverSystems::SolveUserConstraints.run_if(super::xpbd_solver_healthy),
+        );
+        #[cfg(feature = "3d")]
+        app.register_required_components::<RigidBody, XpbdVelocityProjection>();
 
         app.register_required_components::<FixedJoint, FixedJointSolverData>();
         app.register_required_components::<RevoluteJoint, RevoluteJointSolverData>();
@@ -61,12 +79,17 @@ impl Plugin for XpbdSolverPlugin {
             SubstepSchedule,
             (
                 store_pre_solve_deltas,
+                #[cfg(feature = "2d")]
                 solve_xpbd_joint::<FixedJoint>,
+                #[cfg(feature = "2d")]
                 solve_xpbd_joint::<RevoluteJoint>,
                 #[cfg(feature = "3d")]
                 solve_xpbd_joint::<SphericalJoint>,
+                #[cfg(feature = "2d")]
                 solve_xpbd_joint::<PrismaticJoint>,
                 solve_xpbd_joint::<DistanceJoint>,
+                #[cfg(feature = "3d")]
+                super::joints::solve_joint_contact_islands,
             )
                 .chain()
                 .in_set(XpbdSolverSystems::SolveConstraints),
@@ -93,6 +116,14 @@ impl Plugin for XpbdSolverPlugin {
             )
                 .chain()
                 .in_set(SolverSystems::Finalize),
+        );
+    }
+
+    #[cfg(feature = "3d")]
+    fn finish(&self, app: &mut App) {
+        assert!(
+            app.is_plugin_added::<crate::dynamics::solver::islands::IslandPlugin>(),
+            "native 3D XPBD assemblies require IslandPlugin"
         );
     }
 }
@@ -150,11 +181,19 @@ pub fn solve_xpbd_joint<
 >(
     mut solver_bodies: ResMut<SolverBodies>,
     body_indices: Query<Option<&SolverBodyIndex>, (With<RigidBody>, Without<RigidBodyDisabled>)>,
-    mut joints: Query<(&mut C, &mut C::SolverData), (Without<RigidBody>, Without<JointDisabled>)>,
+    mut joints: Query<
+        (Entity, &mut C, &mut C::SolverData),
+        (Without<RigidBody>, Without<JointDisabled>),
+    >,
     time: Res<Time>,
+    mut physics_time: ResMut<Time<Physics>>,
+    mut status: ResMut<XpbdSolverStatus>,
 ) where
     C::SolverData: Component<Mutability = Mutable>,
 {
+    if status.failure.is_some() {
+        return;
+    }
     let delta_secs = time.delta_secs();
 
     let access = solver_bodies.access();
@@ -162,7 +201,7 @@ pub fn solve_xpbd_joint<
     let mut dummy_body1 = SolverBody::default();
     let mut dummy_body2 = SolverBody::default();
 
-    for (mut joint, mut solver_data) in &mut joints {
+    for (entity, mut joint, mut solver_data) in &mut joints {
         let [entity1, entity2] = joint.entities();
 
         let Ok([index1, index2]) = body_indices.get_many([entity1, entity2]) else {
@@ -198,12 +237,19 @@ pub fn solve_xpbd_joint<
             _ => {}
         }
 
-        joint.solve(
+        if let Err(reason) = joint.solve(
             [body1, body2],
             [inertia1, inertia2],
             &mut solver_data,
             delta_secs,
-        );
+        ) {
+            status.failure = Some(ConstraintSolveFailure {
+                constraints: vec![entity],
+                reason,
+            });
+            physics_time.pause();
+            return;
+        }
     }
 }
 
@@ -236,7 +282,11 @@ fn project_linear_velocity(
         (With<XpbdVelocityProjection>, RigidBodyActiveFilter),
     >,
     time: Res<Time>,
+    status: Res<XpbdSolverStatus>,
 ) {
+    if status.failure.is_some() {
+        return;
+    }
     let delta_secs = time.delta_secs();
 
     let access = solver_bodies.access();
@@ -259,7 +309,11 @@ fn project_angular_velocity(
         (With<XpbdVelocityProjection>, RigidBodyActiveFilter),
     >,
     time: Res<Time>,
+    status: Res<XpbdSolverStatus>,
 ) {
+    if status.failure.is_some() {
+        return;
+    }
     let delta_secs = time.delta_secs();
 
     let access = solver_bodies.access();
@@ -281,7 +335,11 @@ fn project_angular_velocity(
         (With<XpbdVelocityProjection>, RigidBodyActiveFilter),
     >,
     time: Res<Time>,
+    status: Res<XpbdSolverStatus>,
 ) {
+    if status.failure.is_some() {
+        return;
+    }
     let delta_secs = time.delta_secs();
 
     let access = solver_bodies.access();

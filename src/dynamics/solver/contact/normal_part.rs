@@ -156,9 +156,34 @@ impl ContactNormalPart {
         let new_impulse = (self.impulse + impulse).max(0.0);
         impulse = new_impulse - self.impulse;
         self.impulse = new_impulse;
-        self.total_impulse += new_impulse;
+        self.total_impulse += impulse;
 
         // Return the clamped incremental normal impulse.
         impulse
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reaction_counts_applied_increments_once() {
+        let mut part = ContactNormalPart {
+            impulse: 0.0,
+            total_impulse: 0.0,
+            effective_mass: 2.0,
+            softness: SoftnessCoefficients::default(),
+        };
+        let mut relative = -3.0;
+        let mut applied = 0.0;
+        for _ in 0..32 {
+            let impulse =
+                part.solve_impulse::<false>(0.0, Vector::Y * relative, Vector::Y, 10.0, 0.01);
+            applied += impulse;
+            relative += impulse / 2.0;
+        }
+        assert_eq!(applied, 6.0);
+        assert_eq!(part.total_impulse, applied);
     }
 }

@@ -212,7 +212,7 @@ impl ContactConstraint {
 
     /// Warm starts the contact constraint by applying the impulses from the previous frame or substep.
     pub fn warm_start(
-        &self,
+        &mut self,
         body1: &mut SolverBody,
         body2: &mut SolverBody,
         inertia1: &SolverBodyInertia,
@@ -226,7 +226,12 @@ impl ContactConstraint {
 
         let tangent_directions = self.tangent_directions();
 
-        for point in self.points.iter() {
+        for point in self.points.iter_mut() {
+            point.normal_part.impulse *= warm_start_coefficient;
+            point.normal_part.total_impulse += point.normal_part.impulse;
+            if let Some(tangent) = &mut point.tangent_part {
+                tangent.impulse *= warm_start_coefficient;
+            }
             // Fixed anchors
             let r1 = point.anchor1;
             let r2 = point.anchor2;
@@ -237,14 +242,12 @@ impl ContactConstraint {
                 .map_or(default(), |part| part.impulse);
 
             #[cfg(feature = "2d")]
-            let p = warm_start_coefficient
-                * (point.normal_part.impulse * self.normal
-                    + tangent_impulse * tangent_directions[0]);
+            let p =
+                point.normal_part.impulse * self.normal + tangent_impulse * tangent_directions[0];
             #[cfg(feature = "3d")]
-            let p = warm_start_coefficient
-                * (point.normal_part.impulse * self.normal
-                    + tangent_impulse.x * tangent_directions[0]
-                    + tangent_impulse.y * tangent_directions[1]);
+            let p = point.normal_part.impulse * self.normal
+                + tangent_impulse.x * tangent_directions[0]
+                + tangent_impulse.y * tangent_directions[1];
 
             body1.linear_velocity -= p * inv_mass1;
             body1.angular_velocity -= inv_angular_inertia1 * cross(r1, p);

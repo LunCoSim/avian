@@ -142,13 +142,12 @@ pub enum XpbdSolverSystems {
 /// A marker component for [rigid bodies](RigidBody) whose velocities should be projected
 /// from the position corrections applied by XPBD constraints.
 ///
-/// The XPBD solver only stores pre-solve deltas and projects velocities for bodies with this
-/// component, so bodies that no XPBD constraint touches are skipped entirely.
+/// In 3D this is required by every [`RigidBody`], because contact support can
+/// transmit an XPBD correction to a body without a joint of its own. Joint
+/// removal and retargeting preserve it.
 ///
-/// This is inserted and removed automatically for the bodies of joints in the [`JointGraph`].
-/// If you implement a [custom XPBD constraint](crate::dynamics::solver::xpbd#custom-constraints)
-/// that is not registered in the joint graph, insert this component on the participating bodies
-/// yourself, or the constraint will have no effect on their velocities.
+/// In 2D the [`JointGraph`] inserts and removes this component for joint bodies.
+/// Custom 2D constraints outside that graph must insert it on their participants.
 ///
 /// [`JointGraph`]: crate::dynamics::joints::joint_graph::JointGraph
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
@@ -245,6 +244,7 @@ pub fn solve_xpbd_joint<
         ) {
             status.failure = Some(ConstraintSolveFailure {
                 constraints: vec![entity],
+                primary_entity: Some(entity),
                 reason,
             });
             physics_time.pause();

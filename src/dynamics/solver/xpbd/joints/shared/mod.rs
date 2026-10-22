@@ -8,5 +8,13 @@ pub use point_constraint::PointConstraintShared;
 mod constraint_rows;
 #[cfg(feature = "3d")]
 pub(super) use constraint_rows::{
-    ConstraintRow, point_rows, solve_bounded_rows, solve_constraint_rows,
+    ConstraintRow, coordinate_scale, jacobian_dot, point_rows, projected_inverse_mass,
+    solve_bounded_rows, solve_constraint_rows,
+};
+
+#[cfg(feature = "3d")]
+mod motor_constraint;
+#[cfg(feature = "3d")]
+pub(super) use motor_constraint::{
+    MotorConstraint, MotorInput, prepare_pair_motor, rows_with_motor,
 };

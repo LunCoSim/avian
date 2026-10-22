@@ -8,6 +8,7 @@ use crate::{
 };
 use bevy::prelude::*;
 
+#[cfg(feature = "2d")]
 use core::f32::consts::{PI, TAU};
 
 /// Constraint data required by the XPBD constraint solver for a [`RevoluteJoint`].
@@ -115,24 +116,29 @@ impl XpbdConstraint<2> for RevoluteJoint {
         dt: f32,
     ) -> Result<(), ConstraintSolveError> {
         let [body1, body2] = bodies;
+        #[cfg(feature = "2d")]
         let [inertia1, inertia2] = inertias;
-
-        // Get the effective inverse angular inertia of the bodies.
-        let inv_angular_inertia1 = inertia1.effective_inv_angular_inertia();
-        let inv_angular_inertia2 = inertia2.effective_inv_angular_inertia();
-
-        // Solve motors before limits to give limits higher priority.
-        self.apply_motor(
-            body1,
-            body2,
-            inv_angular_inertia1,
-            inv_angular_inertia2,
-            solver_data,
-            dt,
-        );
 
         #[cfg(feature = "2d")]
         {
+            let inv_angular_inertia1 = inertia1.effective_inv_angular_inertia();
+            let inv_angular_inertia2 = inertia2.effective_inv_angular_inertia();
+            if self.motor.enabled {
+                super::validate_motor_parameters(
+                    self.motor.motor_model,
+                    self.motor.max_torque,
+                    self.motor.target_position,
+                    self.motor.target_velocity,
+                )?;
+            }
+            self.apply_motor(
+                body1,
+                body2,
+                inv_angular_inertia1,
+                inv_angular_inertia2,
+                solver_data,
+                dt,
+            );
             self.apply_angle_limits(
                 body1,
                 body2,
@@ -147,10 +153,27 @@ impl XpbdConstraint<2> for RevoluteJoint {
         }
         #[cfg(feature = "3d")]
         {
-            let mut accumulated = [0.0; 6];
             let mut bound = None;
-            for _ in 0..4 {
-                let rows = self.frame_rows(body1, body2, solver_data, &mut bound);
+            let initial_rows = self.frame_rows(body1, body2, solver_data, &mut bound);
+            let input = self.motor_input(body1, body2, solver_data);
+            let motor =
+                super::shared::prepare_pair_motor(input.as_ref(), &initial_rows, inertias, dt)?;
+            let mut accumulated = [0.0; 7];
+            for iteration in 0..4 {
+                let frames = self.frame_rows(body1, body2, solver_data, &mut bound);
+                let rows = super::shared::rows_with_motor(
+                    frames,
+                    motor.as_ref(),
+                    self.motor_input(body1, body2, solver_data),
+                );
+                if (iteration != 0 || motor.is_none())
+                    && rows
+                        .iter()
+                        .zip(accumulated)
+                        .all(|(row, lambda)| row.violation(lambda, dt) <= row.tolerance())
+                {
+                    break;
+                }
                 let update = super::shared::solve_constraint_rows(
                     [body1, body2],
                     inertias,
@@ -164,8 +187,10 @@ impl XpbdConstraint<2> for RevoluteJoint {
                         solver_data.point_constraint.total_lagrange -= row.linear2 * impulse;
                     } else if index < 5 {
                         solver_data.total_align_lagrange -= row.angular2 * impulse;
-                    } else {
+                    } else if index == 5 {
                         solver_data.total_limit_lagrange -= row.angular2 * impulse;
+                    } else {
+                        solver_data.total_motor_lagrange -= row.angular2 * impulse;
                     }
                 }
             }
@@ -212,7 +237,8 @@ impl RevoluteJoint {
     /// Applies motor forces to drive the joint towards the target velocity and/or position.
     ///
     /// Uses a PD controller approach with optional implicit Euler integration improved stability.
-    pub(super) fn apply_motor(
+    #[cfg(feature = "2d")]
+    fn apply_motor(
         &self,
         body1: &mut SolverBody,
         body2: &mut SolverBody,
@@ -227,36 +253,10 @@ impl RevoluteJoint {
             return;
         }
 
-        #[cfg(feature = "2d")]
         let current_angle =
             solver_data.rotation_difference + body1.delta_rotation.angle_to(body2.delta_rotation);
-        #[cfg(feature = "3d")]
-        let a1 = body1.delta_rotation * solver_data.a1;
-        #[cfg(feature = "3d")]
-        let current_angle = {
-            let b1 = body1.delta_rotation * solver_data.b1;
-            let b2 = body2.delta_rotation * solver_data.b2;
-            let sin_angle = b1.cross(b2).dot(a1);
-            let cos_angle = b1.dot(b2);
-            sin_angle.atan2(cos_angle)
-        };
-
-        #[cfg(feature = "2d")]
         let relative_angular_velocity = body2.angular_velocity - body1.angular_velocity;
-        #[cfg(feature = "3d")]
-        let relative_angular_velocity = (body2.angular_velocity - body1.angular_velocity).dot(a1);
-
-        #[cfg(feature = "2d")]
         let w_sum = inv_angular_inertia1 + inv_angular_inertia2;
-        #[cfg(feature = "3d")]
-        let w_sum =
-            AngularConstraint::compute_generalized_inverse_mass(self, inv_angular_inertia1, a1)
-                + AngularConstraint::compute_generalized_inverse_mass(
-                    self,
-                    inv_angular_inertia2,
-                    a1,
-                );
-
         if w_sum <= 0.0 {
             return;
         }
@@ -276,32 +276,16 @@ impl RevoluteJoint {
             dt,
         );
 
-        #[cfg(feature = "2d")]
         {
             solver_data.total_motor_lagrange -= delta_lagrange;
         }
-        #[cfg(feature = "3d")]
-        {
-            solver_data.total_motor_lagrange -= delta_lagrange * a1;
-        }
-
         // Positive delta_lagrange increases body2's angular velocity relative to body1.
-        #[cfg(feature = "2d")]
         self.apply_angular_lagrange_update(
             body1,
             body2,
             inv_angular_inertia1,
             inv_angular_inertia2,
             delta_lagrange,
-        );
-        #[cfg(feature = "3d")]
-        self.apply_angular_lagrange_update(
-            body1,
-            body2,
-            inv_angular_inertia1,
-            inv_angular_inertia2,
-            delta_lagrange,
-            a1,
         );
     }
 }
@@ -312,6 +296,36 @@ impl AngularConstraint for RevoluteJoint {}
 
 #[cfg(feature = "3d")]
 impl RevoluteJoint {
+    pub(super) fn motor_input(
+        &self,
+        body1: &SolverBody,
+        body2: &SolverBody,
+        data: &RevoluteJointSolverData,
+    ) -> Option<super::shared::MotorInput> {
+        if !self.motor.enabled {
+            return None;
+        }
+        let axis = body1.delta_rotation * data.a1;
+        let b1 = body1.delta_rotation * data.b1;
+        let b2 = body2.delta_rotation * data.b2;
+        let row = super::shared::ConstraintRow {
+            angular1: -axis,
+            angular2: axis,
+            kind: ConstraintResidualKind::Angular,
+            ..default()
+        };
+        Some(super::shared::MotorInput {
+            model: self.motor.motor_model,
+            coordinate: b1.cross(b2).dot(axis).atan2(b1.dot(b2)),
+            velocity: row.velocity([body1, body2]),
+            target_position: self.motor.target_position,
+            target_velocity: self.motor.target_velocity,
+            max_force: self.motor.max_torque,
+            angular: true,
+            jacobian: row,
+        })
+    }
+
     pub(super) fn frame_rows(
         &self,
         body1: &SolverBody,
@@ -327,7 +341,14 @@ impl RevoluteJoint {
         let a2 = body2.delta_rotation * data.a2;
         let tangent = a1.any_orthonormal_vector();
         let bitangent = a1.cross(tangent);
-        let error = Quat::from_rotation_arc(a1, a2).to_scaled_axis();
+        // Evaluate the arc in f64 so the library's near-parallel cutoff stays
+        // below the native angular residual precision.
+        let error = bevy::math::DQuat::from_rotation_arc(
+            a1.as_dvec3().normalize(),
+            a2.as_dvec3().normalize(),
+        )
+        .to_scaled_axis()
+        .as_vec3();
         let mut points =
             super::shared::point_rows(r1, r2, separation, self.point_compliance).into_iter();
         let mut rows = core::array::from_fn(|index| {
@@ -340,14 +361,17 @@ impl RevoluteJoint {
         for (index, axis) in [tangent, bitangent].into_iter().enumerate() {
             rows[index + 3].angular1 = -axis;
             rows[index + 3].angular2 = axis;
-            rows[index + 3].error = error.dot(axis);
-            rows[index + 3].compliance = self.align_compliance;
+            rows[index + 3].error = f64::from(error.dot(axis));
+            rows[index + 3].kind = ConstraintResidualKind::Angular;
+            rows[index + 3].compliance = f64::from(self.align_compliance);
         }
         let b1 = body1.delta_rotation * data.b1;
         let b2 = body2.delta_rotation * data.b2;
         let angle = b1.cross(b2).dot(a1).atan2(b1.dot(b2));
         if let Some(limits) = self.angle_limit {
-            if angle < limits.min {
+            if limits.min == limits.max {
+                *bound = Some((limits.min, [f64::NEG_INFINITY, f64::INFINITY]));
+            } else if angle < limits.min {
                 *bound = Some((limits.min, [0.0, f64::INFINITY]));
             } else if angle > limits.max {
                 *bound = Some((limits.max, [f64::NEG_INFINITY, 0.0]));
@@ -356,10 +380,35 @@ impl RevoluteJoint {
         if let Some((limit, bounds)) = *bound {
             rows[5].angular1 = -a1;
             rows[5].angular2 = a1;
-            rows[5].error = angle - limit;
-            rows[5].compliance = self.limit_compliance;
+            rows[5].error = f64::from(angle - limit);
+            rows[5].kind = ConstraintResidualKind::Angular;
+            rows[5].compliance = f64::from(self.limit_compliance);
             rows[5].bounds = bounds;
         }
         rows
+    }
+}
+
+#[cfg(all(test, feature = "3d"))]
+mod tests {
+    use super::*;
+    #[test]
+    fn hinge_alignment_retains_small_finite_angles() {
+        let joint = RevoluteJoint::new(Entity::PLACEHOLDER, Entity::PLACEHOLDER);
+        for angle in [0.0001, 0.1, 1.0] {
+            let data = RevoluteJointSolverData {
+                a1: Vec3::Y,
+                a2: Quat::from_rotation_z(angle) * Vec3::Y,
+                b1: Vec3::X,
+                b2: Vec3::X,
+                ..default()
+            };
+            let rows = joint.frame_rows(&SolverBody::DUMMY, &SolverBody::DUMMY, &data, &mut None);
+            let magnitude = rows[3].error.hypot(rows[4].error);
+            assert!(
+                (magnitude - f64::from(angle)).abs() < 1e-7,
+                "angle={angle}, residual={magnitude}"
+            );
+        }
     }
 }

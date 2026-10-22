@@ -6,7 +6,7 @@
 //! Splitting is deferred and done using depth-first search (DFS). Only one island is split per time step,
 //! choosing the sleepiest island with one or more constraints removed as the candidate.
 //!
-//! Islands are only used for sleeping and waking. Solver parallelism is achieved with [graph coloring](super::constraint_graph)
+//! Contact velocity solver parallelism uses [graph coloring](super::constraint_graph)
 //! using the [`ConstraintGraph`](super::constraint_graph::ConstraintGraph).
 //!
 //! Native 3D XPBD assemblies use this connectivity for coupled joint/contact

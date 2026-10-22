@@ -98,7 +98,18 @@ impl XpbdConstraint<2> for PrismaticJoint {
             .solve([body1, body2], inertias, self.angle_compliance, dt);
 
         // Solve motors before limits to give limits higher priority.
-        self.apply_motor(body1, body2, inertias[0], inertias[1], solver_data, dt);
+        #[cfg(feature = "2d")]
+        {
+            if self.motor.enabled {
+                super::validate_motor_parameters(
+                    self.motor.motor_model,
+                    self.motor.max_force,
+                    self.motor.target_position,
+                    self.motor.target_velocity,
+                )?;
+            }
+            self.apply_motor(body1, body2, inertias[0], inertias[1], solver_data, dt);
+        }
 
         #[cfg(feature = "2d")]
         self.constrain_positions(body1, body2, inertias[0], inertias[1], solver_data, dt);
@@ -200,14 +211,24 @@ impl PrismaticJoint {
         dt: f32,
     ) -> Result<(), ConstraintSolveError> {
         let [body1, body2] = bodies;
-        let mut accumulated = [0.0_f64; 6];
         let mut bound = None;
-        for _ in 0..3 {
-            let rows = self.frame_rows(body1, body2, data, &mut bound);
-            let axis = body1.delta_rotation * data.free_axis1;
-            let tangent = axis.any_orthonormal_vector();
-            let bitangent = axis.cross(tangent);
-            if rows.iter().all(|row| row.error.abs() < 1.0e-7) {
+        let initial_rows = self.frame_rows(body1, body2, data, &mut bound);
+        let input = self.motor_input(body1, body2, data);
+        let motor = super::shared::prepare_pair_motor(input.as_ref(), &initial_rows, inertias, dt)?;
+        let mut accumulated = [0.0_f64; 7];
+        for iteration in 0..4 {
+            let frames = self.frame_rows(body1, body2, data, &mut bound);
+            let rows = super::shared::rows_with_motor(
+                frames,
+                motor.as_ref(),
+                self.motor_input(body1, body2, data),
+            );
+            if (iteration != 0 || motor.is_none())
+                && rows
+                    .iter()
+                    .zip(accumulated)
+                    .all(|(row, lambda)| row.violation(lambda, dt) <= row.tolerance())
+            {
                 break;
             }
             let update = super::shared::solve_constraint_rows(
@@ -217,12 +238,56 @@ impl PrismaticJoint {
                 &mut accumulated,
                 dt,
             )?;
-            data.total_position_lagrange -=
-                tangent * update[0] + bitangent * update[1] + axis * update[2];
-            data.angle_constraint.total_lagrange -= Vec3::new(update[3], update[4], update[5]);
+            for (index, row) in rows.iter().enumerate() {
+                if index < 3 || index == 6 {
+                    data.total_position_lagrange -= row.linear2 * update[index];
+                } else {
+                    data.angle_constraint.total_lagrange -= row.angular2 * update[index];
+                }
+            }
+            data.total_motor_lagrange += update[6];
         }
         Ok(())
     }
+    pub(super) fn motor_input(
+        &self,
+        body1: &SolverBody,
+        body2: &SolverBody,
+        data: &PrismaticJointSolverData,
+    ) -> Option<super::shared::MotorInput> {
+        if !self.motor.enabled {
+            return None;
+        }
+        let r1 = body1.delta_rotation * data.world_r1;
+        let r2 = body2.delta_rotation * data.world_r2;
+        let separation =
+            body2.delta_position - body1.delta_position + r2 - r1 + data.center_difference;
+        let axis = body1.delta_rotation * data.free_axis1;
+        let row = super::shared::ConstraintRow {
+            linear1: -axis,
+            linear2: axis,
+            angular1: axis.cross(r1 + separation),
+            angular2: r2.cross(axis),
+            error_scale: super::shared::coordinate_scale(&[
+                r1,
+                r2,
+                separation,
+                data.center_difference,
+            ]),
+            ..default()
+        };
+        Some(super::shared::MotorInput {
+            model: self.motor.motor_model,
+            coordinate: separation.dot(axis),
+            velocity: row.velocity([body1, body2]),
+            target_position: self.motor.target_position,
+            target_velocity: self.motor.target_velocity,
+            max_force: self.motor.max_force,
+            angular: false,
+            jacobian: row,
+        })
+    }
+
     pub(super) fn frame_rows(
         &self,
         body1: &SolverBody,
@@ -242,7 +307,9 @@ impl PrismaticJoint {
             .error(body1.delta_rotation, body2.delta_rotation);
         let slide = separation.dot(axis);
         if let Some(limits) = self.limits {
-            if slide < limits.min {
+            if limits.min == limits.max {
+                *bound = Some((limits.min, [f64::NEG_INFINITY, f64::INFINITY]));
+            } else if slide < limits.min {
                 *bound = Some((limits.min, [0.0, f64::INFINITY]));
             } else if slide > limits.max {
                 *bound = Some((limits.max, [f64::NEG_INFINITY, 0.0]));
@@ -258,20 +325,23 @@ impl PrismaticJoint {
             // Differentiating the moving axis adds direction x separation.
             rows[index].angular1 = direction.cross(r1 + separation);
             rows[index].angular2 = r2.cross(direction);
-            rows[index].error = separation.dot(direction);
-            rows[index].compliance = self.align_compliance;
+            rows[index].error = f64::from(separation.dot(direction));
+            rows[index].error_scale =
+                super::shared::coordinate_scale(&[r1, r2, separation, data.center_difference]);
+            rows[index].compliance = f64::from(self.align_compliance);
             if index == 2 {
                 let (limit, bounds) = (*bound).unwrap();
-                rows[index].error -= limit;
-                rows[index].compliance = self.limit_compliance;
+                rows[index].error -= f64::from(limit);
+                rows[index].compliance = f64::from(self.limit_compliance);
                 rows[index].bounds = bounds;
             }
         }
         for (index, direction) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
             rows[index + 3].angular1 = -direction;
             rows[index + 3].angular2 = direction;
-            rows[index + 3].error = angular_error[index];
-            rows[index + 3].compliance = self.angle_compliance;
+            rows[index + 3].error = f64::from(angular_error[index]);
+            rows[index + 3].kind = ConstraintResidualKind::Angular;
+            rows[index + 3].compliance = f64::from(self.angle_compliance);
         }
 
         rows
@@ -280,7 +350,8 @@ impl PrismaticJoint {
 
 impl PrismaticJoint {
     /// Applies motor forces to drive the joint towards the target velocity and/or position.
-    pub(super) fn apply_motor(
+    #[cfg(feature = "2d")]
+    fn apply_motor(
         &self,
         body1: &mut SolverBody,
         body2: &mut SolverBody,

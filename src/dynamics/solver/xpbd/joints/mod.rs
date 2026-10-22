@@ -17,8 +17,59 @@ pub use revolute::RevoluteJointSolverData;
 #[cfg(feature = "3d")]
 pub use spherical::SphericalJointSolverData;
 
+fn motor_gains(model: crate::prelude::MotorModel, inverse_mass: f64) -> (f64, f64) {
+    use crate::prelude::MotorModel;
+    match model {
+        MotorModel::ForceBased { stiffness, damping } => (f64::from(stiffness), f64::from(damping)),
+        MotorModel::AccelerationBased { stiffness, damping } => (
+            f64::from(stiffness) / inverse_mass,
+            f64::from(damping) / inverse_mass,
+        ),
+        MotorModel::SpringDamper {
+            frequency,
+            damping_ratio,
+        } => {
+            let omega = core::f64::consts::TAU * f64::from(frequency);
+            (
+                omega * omega / inverse_mass,
+                2.0 * f64::from(damping_ratio) * omega / inverse_mass,
+            )
+        }
+    }
+}
+fn validate_motor_parameters(
+    model: crate::prelude::MotorModel,
+    cap: f32,
+    position: f32,
+    velocity: f32,
+) -> Result<(), crate::dynamics::solver::xpbd::ConstraintSolveError> {
+    use crate::prelude::MotorModel;
+    let (a, b) = match model {
+        MotorModel::ForceBased { stiffness, damping }
+        | MotorModel::AccelerationBased { stiffness, damping } => (stiffness, damping),
+        MotorModel::SpringDamper {
+            frequency,
+            damping_ratio,
+        } => (frequency, damping_ratio),
+    };
+    if !a.is_finite()
+        || a < 0.0
+        || !b.is_finite()
+        || b < 0.0
+        || cap.is_nan()
+        || cap < 0.0
+        || !position.is_finite()
+        || !velocity.is_finite()
+    {
+        Err(crate::dynamics::solver::xpbd::ConstraintSolveError::InvalidMotorParameters)
+    } else {
+        Ok(())
+    }
+}
+
 /// Positional multiplier for an implicit spring-damper impulse at an already
 /// integrated coordinate. In XPBD, physical impulse is this multiplier / dt.
+#[cfg(any(feature = "2d", test))]
 fn motor_lagrange(
     model: crate::prelude::MotorModel,
     position_error: f32,
@@ -27,33 +78,14 @@ fn motor_lagrange(
     max_force: f32,
     dt: f32,
 ) -> f32 {
-    use crate::prelude::MotorModel;
     if inverse_mass == 0.0 || dt == 0.0 || max_force == 0.0 {
         return 0.0;
     }
-    // Evaluate coefficients in f64 so finite f32 gains do not overflow while
-    // forming the implicit denominator. Solver state and the result remain f32.
     let h = f64::from(dt);
     let w = f64::from(inverse_mass);
-    let (stiffness, damping, mobility) = match model {
-        MotorModel::ForceBased { stiffness, damping } => {
-            (f64::from(stiffness), f64::from(damping), w)
-        }
-        MotorModel::AccelerationBased { stiffness, damping } => {
-            (f64::from(stiffness), f64::from(damping), 1.0)
-        }
-        MotorModel::SpringDamper {
-            frequency,
-            damping_ratio,
-        } => {
-            let omega = core::f64::consts::TAU * f64::from(frequency);
-            (omega * omega, 2.0 * f64::from(damping_ratio) * omega, 1.0)
-        }
-    };
-    let acceleration = mobility
-        * (stiffness * f64::from(position_error) + damping * f64::from(velocity_error))
-        / (1.0 + mobility * h * (damping + stiffness * h));
-    let force = acceleration / w;
+    let (stiffness, damping) = motor_gains(model, w);
+    let force = (stiffness * f64::from(position_error) + damping * f64::from(velocity_error))
+        / (1.0 + w * h * (damping + stiffness * h));
     (force.clamp(-f64::from(max_force), f64::from(max_force)) * h * h) as f32
 }
 

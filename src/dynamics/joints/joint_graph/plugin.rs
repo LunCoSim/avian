@@ -1,7 +1,7 @@
 use core::marker::PhantomData;
 
 use super::{JointGraph, JointGraphEdge, JointId};
-#[cfg(feature = "xpbd_joints")]
+#[cfg(all(feature = "xpbd_joints", feature = "2d"))]
 use crate::dynamics::solver::xpbd::XpbdVelocityProjection;
 use crate::{
     collision::contact_types::ContactId,
@@ -133,7 +133,7 @@ fn add_joint_to_graph<
     query: Query<(&T, Has<JointCollisionDisabled>), F>,
     mut joint_graph: ResMut<JointGraph>,
     mut joint_graph_changes: MessageWriter<JointGraphChange>,
-    #[cfg(feature = "xpbd_joints")] mut commands: Commands,
+    #[cfg(all(feature = "xpbd_joints", feature = "2d"))] mut commands: Commands,
 ) {
     let entity = trigger.event_target();
 
@@ -148,7 +148,7 @@ fn add_joint_to_graph<
     let joint_id = joint_graph.add_joint(joint_edge);
 
     // The bodies are now constrained, so the XPBD solver must project their velocities.
-    #[cfg(feature = "xpbd_joints")]
+    #[cfg(all(feature = "xpbd_joints", feature = "2d"))]
     for body in [body1, body2] {
         commands.entity(body).try_insert(XpbdVelocityProjection);
     }
@@ -161,7 +161,7 @@ fn remove_joint_from_graph<E: EventPattern<Event: EntityEvent>>(
     trigger: On<E>,
     mut joint_graph: ResMut<JointGraph>,
     mut joint_graph_changes: MessageWriter<JointGraphChange>,
-    #[cfg(feature = "xpbd_joints")] mut commands: Commands,
+    #[cfg(all(feature = "xpbd_joints", feature = "2d"))] mut commands: Commands,
 ) {
     let entity = trigger.event_target();
 
@@ -171,14 +171,14 @@ fn remove_joint_from_graph<E: EventPattern<Event: EntityEvent>>(
 
     // Record the change.
     joint_graph_changes.write(JointGraphChange::Removed(joint.id));
-    #[cfg(feature = "xpbd_joints")]
+    #[cfg(all(feature = "xpbd_joints", feature = "2d"))]
     let bodies = [joint.body1, joint.body2];
 
     // Remove the joint from the joint graph.
     joint_graph.remove_joint(entity);
 
     // Stop projecting XPBD velocities for bodies that are no longer constrained by any joint.
-    #[cfg(feature = "xpbd_joints")]
+    #[cfg(all(feature = "xpbd_joints", feature = "2d"))]
     for body in bodies {
         if joint_graph.joints_of(body).next().is_none() {
             commands.entity(body).try_remove::<XpbdVelocityProjection>();
@@ -295,7 +295,7 @@ fn on_change_joint_entities<T: Component + EntityConstraint<2>>(
     query: Query<(Entity, &T), Changed<T>>,
     mut joint_graph: ResMut<JointGraph>,
     mut joint_graph_changes: MessageWriter<JointGraphChange>,
-    #[cfg(feature = "xpbd_joints")] mut commands: Commands,
+    #[cfg(all(feature = "xpbd_joints", feature = "2d"))] mut commands: Commands,
 ) {
     for (entity, joint) in &query {
         let [body1, body2] = joint.entities();
@@ -305,7 +305,7 @@ fn on_change_joint_entities<T: Component + EntityConstraint<2>>(
 
         if body1 != old_edge.body1 || body2 != old_edge.body2 {
             let old_id = old_edge.id;
-            #[cfg(feature = "xpbd_joints")]
+            #[cfg(all(feature = "xpbd_joints", feature = "2d"))]
             let old_bodies = [old_edge.body1, old_edge.body2];
 
             // Remove the old joint edge.
@@ -324,7 +324,7 @@ fn on_change_joint_entities<T: Component + EntityConstraint<2>>(
                 joint_graph_changes.write(JointGraphChange::Added(joint_id));
 
                 // Move XPBD velocity projection over to the new bodies.
-                #[cfg(feature = "xpbd_joints")]
+                #[cfg(all(feature = "xpbd_joints", feature = "2d"))]
                 {
                     for body in [body1, body2] {
                         commands.entity(body).try_insert(XpbdVelocityProjection);

@@ -174,11 +174,10 @@
 //! of [`JointGraphPlugin`](crate::dynamics::joints::joint_graph::JointGraphPlugin) for the constraint type.
 //! This is required for sleeping and the `JointCollisionDisabled` component to work.
 //!
-//! The [`JointGraphPlugin`](crate::dynamics::joints::joint_graph::JointGraphPlugin) also inserts
-//! [`XpbdVelocityProjection`] on the bodies it connects. Only bodies with that component have their
-//! velocities updated from the position corrections applied by XPBD constraints, so if your constraint
-//! is *not* registered in the joint graph, insert [`XpbdVelocityProjection`] on the participating
-//! bodies yourself.
+//! In 3D, every rigid body requires [`XpbdVelocityProjection`], including bodies
+//! that receive corrections through contact support. In 2D, the joint graph
+//! installs it on joint bodies; custom constraints outside that graph must
+//! install it on their participants.
 //!
 //! You can find a working example of a custom constraint
 //! [here](https://github.com/avianphysics/avian/blob/main/crates/avian3d/examples/custom_constraint.rs).
@@ -313,8 +312,19 @@ use bevy::{ecs::reflect::ReflectResource, reflect::std_traits::ReflectDefault};
 
 use super::solver_body::{SolverBody, SolverBodyInertia};
 
+/// Coordinate space of a rejected scalar constraint residual.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bevy::prelude::Reflect)]
+pub enum ConstraintResidualKind {
+    /// Translation in native length units.
+    Linear,
+    /// Rotation in radians.
+    Angular,
+    /// Unilateral separation along a contact normal.
+    ContactNormal,
+}
+
 /// A native constraint solve that cannot produce a finite, bounded result.
-#[derive(Clone, Debug, PartialEq, Eq, bevy::prelude::Reflect)]
+#[derive(Clone, Debug, PartialEq, bevy::prelude::Reflect)]
 pub enum ConstraintSolveError {
     /// The linearized system has a non-finite coefficient or residual.
     NonFiniteSystem,
@@ -322,7 +332,19 @@ pub enum ConstraintSolveError {
     NonlinearIterationLimit {
         /// Number of refinements applied.
         iterations: usize,
+        /// Index of the rejected scalar row in the island solve.
+        row: usize,
+        /// Signed residual after compliance, in the row's coordinate space.
+        residual: f64,
+        /// Native input precision for that residual.
+        tolerance: f64,
+        /// Coordinate space of the residual.
+        kind: ConstraintResidualKind,
     },
+    /// A motor has non-finite or negative gains or an invalid effort limit.
+    InvalidMotorParameters,
+    /// The projected mechanism mobility is not positive semidefinite.
+    InvalidEffectiveMass,
     /// A correction cannot be represented in the native solver state.
     NonFiniteCorrection,
     /// The bounded active set exhausted its dimension-dependent work budget.
@@ -337,10 +359,22 @@ impl core::fmt::Display for ConstraintSolveError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NonFiniteSystem => f.write_str("constraint system contains non-finite values"),
-            Self::NonlinearIterationLimit { iterations } => write!(
+            Self::NonlinearIterationLimit {
+                iterations,
+                row,
+                residual,
+                tolerance,
+                kind,
+            } => write!(
                 f,
-                "constraint residual exceeds native tolerance after {iterations} refinements"
+                "constraint row {row} ({kind:?}) residual {residual:e} exceeds native precision {tolerance:e} after {iterations} refinements"
             ),
+            Self::InvalidMotorParameters => f.write_str(
+                "motor requires finite nonnegative gains and a nonnegative effort limit",
+            ),
+            Self::InvalidEffectiveMass => {
+                f.write_str("projected mechanism mobility is not positive semidefinite")
+            }
             Self::NonFiniteCorrection => {
                 f.write_str("constraint correction exceeds native solver precision")
             }
@@ -359,6 +393,8 @@ impl core::fmt::Display for ConstraintSolveError {
 pub struct ConstraintSolveFailure {
     /// Constraints participating in the rejected solve.
     pub constraints: Vec<bevy::prelude::Entity>,
+    /// Exact constraint or body owner when a particular row identifies one.
+    pub primary_entity: Option<bevy::prelude::Entity>,
     /// The native reason for rejecting the solve.
     pub reason: ConstraintSolveError,
 }

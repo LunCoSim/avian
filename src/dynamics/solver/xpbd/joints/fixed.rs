@@ -177,8 +177,9 @@ pub(super) fn frame_rows(
             super::shared::ConstraintRow {
                 angular1: -axis,
                 angular2: axis,
-                error: angular_error[index - 3],
-                compliance: angle_compliance,
+                error: f64::from(angular_error[index - 3]),
+                kind: crate::dynamics::solver::xpbd::ConstraintResidualKind::Angular,
+                compliance: f64::from(angle_compliance),
                 ..default()
             }
         }

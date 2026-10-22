@@ -1,6 +1,6 @@
 use crate::dynamics::solver::solver_body::{SolverBody, SolverBodyInertia};
-use crate::dynamics::solver::xpbd::ConstraintSolveError;
-use bevy::prelude::*;
+use crate::dynamics::solver::xpbd::{ConstraintResidualKind, ConstraintSolveError};
+use bevy::{math::DVec3, prelude::*};
 
 /// One scalar world-space Jacobian row. Impulse bounds apply to the accumulated
 /// multiplier in this substep, including all nonlinear refinements.
@@ -10,8 +10,10 @@ pub(crate) struct ConstraintRow {
     pub linear2: Vec3,
     pub angular1: Vec3,
     pub angular2: Vec3,
-    pub error: f32,
-    pub compliance: f32,
+    pub error: f64,
+    pub compliance: f64,
+    pub error_scale: f64,
+    pub kind: ConstraintResidualKind,
     pub bounds: [f64; 2],
 }
 
@@ -24,55 +26,155 @@ impl Default for ConstraintRow {
             angular2: Vec3::ZERO,
             error: 0.0,
             compliance: 0.0,
+            error_scale: 1.0,
+            kind: ConstraintResidualKind::Linear,
             bounds: [f64::NEG_INFINITY, f64::INFINITY],
         }
     }
 }
 
+impl ConstraintRow {
+    pub(crate) fn tolerance(&self) -> f64 {
+        8.0 * f64::from(f32::EPSILON) * self.error_scale
+    }
+    pub(crate) fn residual(&self, lambda: f64, dt: f32) -> f64 {
+        self.error + self.compliance * lambda / f64::from(dt).powi(2)
+    }
+    pub(crate) fn violation(&self, lambda: f64, dt: f32) -> f64 {
+        let residual = self.residual(lambda, dt);
+        if self.bounds[0] == self.bounds[1] {
+            0.0
+        } else if lambda == self.bounds[0] {
+            (-residual).max(0.0)
+        } else if lambda == self.bounds[1] {
+            residual.max(0.0)
+        } else {
+            residual.abs()
+        }
+    }
+    pub(crate) fn velocity(&self, bodies: [&SolverBody; 2]) -> f32 {
+        self.linear1.dot(bodies[0].linear_velocity)
+            + self.linear2.dot(bodies[1].linear_velocity)
+            + self.angular1.dot(bodies[0].angular_velocity)
+            + self.angular2.dot(bodies[1].angular_velocity)
+    }
+}
+
+pub(crate) fn coordinate_scale(vectors: &[Vec3]) -> f64 {
+    vectors
+        .iter()
+        .map(|vector| f64::from(vector.abs().max_element()))
+        .sum::<f64>()
+        .max(1.0)
+}
+
+pub(crate) fn jacobian_dot(
+    a: (DVec3, DVec3),
+    b: (DVec3, DVec3),
+    inertia: &SolverBodyInertia,
+) -> f64 {
+    a.0.dot(inertia.effective_inv_mass().as_dvec3() * b.0)
+        + a.1
+            .dot(Mat3::from(inertia.effective_inv_angular_inertia()).as_dmat3() * b.1)
+}
+pub(crate) fn pair_inverse_mass(
+    a: &ConstraintRow,
+    b: &ConstraintRow,
+    inertias: [&SolverBodyInertia; 2],
+) -> f64 {
+    jacobian_dot(
+        (a.linear1.as_dvec3(), a.angular1.as_dvec3()),
+        (b.linear1.as_dvec3(), b.angular1.as_dvec3()),
+        inertias[0],
+    ) + jacobian_dot(
+        (a.linear2.as_dvec3(), a.angular2.as_dvec3()),
+        (b.linear2.as_dvec3(), b.angular2.as_dvec3()),
+        inertias[1],
+    )
+}
+
+/// Mobility after the bilateral mechanism has transmitted an impulse.
+pub(crate) fn projected_inverse_mass(
+    mass: &[f64],
+    coupling: &[f64],
+    free_mass: f64,
+) -> Result<f64, ConstraintSolveError> {
+    let mut factors = mass.to_vec();
+    let mut rhs = coupling.to_vec();
+    let mut solution = vec![0.0; rhs.len()];
+    solve_rank_revealing(&mut factors, &mut rhs, &mut solution);
+    let reduction: f64 = coupling.iter().zip(&solution).map(|(a, b)| a * b).sum();
+    let projected = free_mass - reduction;
+    let scale = free_mass.abs()
+        + coupling
+            .iter()
+            .zip(&solution)
+            .map(|(a, b)| (a * b).abs())
+            .sum::<f64>();
+    let tolerance = 128.0 * f64::EPSILON * scale * (coupling.len() + 1) as f64;
+    if !projected.is_finite() || projected < -tolerance {
+        return Err(ConstraintSolveError::InvalidEffectiveMass);
+    }
+    Ok(if projected.abs() <= tolerance {
+        0.0
+    } else {
+        projected
+    })
+}
+
+pub(crate) fn pair_projected_mass(
+    rows: &[ConstraintRow],
+    motor: &ConstraintRow,
+    inertias: [&SolverBodyInertia; 2],
+    dt: f32,
+) -> Result<f64, ConstraintSolveError> {
+    let bilateral: Vec<_> = rows
+        .iter()
+        .filter(|row| row.bounds == [f64::NEG_INFINITY, f64::INFINITY])
+        .collect();
+    let n = bilateral.len();
+    let mut mass = vec![0.0; n * n];
+    let mut coupling = vec![0.0; n];
+    for (i, row) in bilateral.iter().enumerate() {
+        for (j, other) in bilateral.iter().enumerate() {
+            mass[i * n + j] = pair_inverse_mass(row, other, inertias);
+        }
+        mass[i * n + i] += row.compliance / f64::from(dt).powi(2);
+        coupling[i] = pair_inverse_mass(row, motor, inertias);
+    }
+    projected_inverse_mass(&mass, &coupling, pair_inverse_mass(motor, motor, inertias))
+}
+
 /// Solve coupled rows with an active set for unilateral constraints.
 /// Locked body degrees of freedom contribute zero mobility.
-pub(crate) fn solve_constraint_rows(
+pub(crate) fn solve_constraint_rows<const N: usize>(
     bodies: [&mut SolverBody; 2],
     inertias: [&SolverBodyInertia; 2],
-    rows: &[ConstraintRow; 6],
-    accumulated: &mut [f64; 6],
+    rows: &[ConstraintRow; N],
+    accumulated: &mut [f64; N],
     dt: f32,
-) -> Result<[f32; 6], ConstraintSolveError> {
+) -> Result<[f32; N], ConstraintSolveError> {
     let [body1, body2] = bodies;
     let [inertia1, inertia2] = inertias;
     let m1 = inertia1.effective_inv_mass();
     let m2 = inertia2.effective_inv_mass();
     let i1 = inertia1.effective_inv_angular_inertia();
     let i2 = inertia2.effective_inv_angular_inertia();
-    let matrix_i1 = Mat3::from(i1).as_dmat3();
-    let matrix_i2 = Mat3::from(i2).as_dmat3();
-    let mut mass = [[0.0_f64; 6]; 6];
-    let mut rhs = [0.0_f64; 6];
+    let mut mass = [[0.0_f64; N]; N];
+    let mut rhs = [0.0_f64; N];
     for (index, row) in rows.iter().enumerate() {
         for (column, other) in rows.iter().enumerate() {
-            mass[index][column] = row
-                .linear1
-                .as_dvec3()
-                .dot(m1.as_dvec3() * other.linear1.as_dvec3())
-                + row
-                    .linear2
-                    .as_dvec3()
-                    .dot(m2.as_dvec3() * other.linear2.as_dvec3())
-                + row
-                    .angular1
-                    .as_dvec3()
-                    .dot(matrix_i1 * other.angular1.as_dvec3())
-                + row
-                    .angular2
-                    .as_dvec3()
-                    .dot(matrix_i2 * other.angular2.as_dvec3());
+            mass[index][column] = pair_inverse_mass(row, other, inertias);
         }
-        let alpha = f64::from(row.compliance) / f64::from(dt).powi(2);
+        let alpha = row.compliance / f64::from(dt).powi(2);
         mass[index][index] += alpha;
-        rhs[index] = -f64::from(row.error) - alpha * accumulated[index];
+        rhs[index] = -row.error - alpha * accumulated[index];
     }
     let bounds: Vec<_> = rows.iter().map(|row| row.bounds).collect();
-    let update = solve_bounded_rows(mass.as_flattened(), &rhs, &bounds, accumulated)?;
+    let tolerances: Vec<_> = rows.iter().map(ConstraintRow::tolerance).collect();
+    let solution =
+        solve_bounded_rows(mass.as_flattened(), &rhs, &bounds, accumulated, &tolerances)?;
+    let update = &solution.delta;
     if update.iter().zip(rows).any(|(&impulse, row)| {
         !impulse.is_finite()
             || impulse.abs() > f64::from(f32::MAX)
@@ -87,12 +189,12 @@ pub(crate) fn solve_constraint_rows(
     let mut p2 = Vec3::ZERO;
     let mut a1 = Vec3::ZERO;
     let mut a2 = Vec3::ZERO;
-    let mut impulses = [0.0; 6];
-    for index in 0..6 {
+    let mut impulses = [0.0; N];
+    for index in 0..N {
         // Native solver coordinates and corrections are explicitly f32.
         let impulse = update[index] as f32;
         impulses[index] = impulse;
-        accumulated[index] += f64::from(impulse);
+        accumulated[index] = solution.total[index];
         p1 += rows[index].linear1 * impulse;
         p2 += rows[index].linear2 * impulse;
         a1 += rows[index].angular1 * impulse;
@@ -112,6 +214,12 @@ pub(crate) fn solve_constraint_rows(
     Ok(impulses)
 }
 
+#[derive(Debug, PartialEq)]
+pub(crate) struct BoundedRowSolution {
+    pub delta: Vec<f64>,
+    pub total: Vec<f64>,
+}
+
 /// Primal feasible active-set solve. Releasing a bound with a negative dual
 /// residual is essential when several contact normals share articulated mass.
 pub(crate) fn solve_bounded_rows(
@@ -119,12 +227,14 @@ pub(crate) fn solve_bounded_rows(
     rhs: &[f64],
     bounds: &[[f64; 2]],
     accumulated: &[f64],
-) -> Result<Vec<f64>, ConstraintSolveError> {
+    tolerances: &[f64],
+) -> Result<BoundedRowSolution, ConstraintSolveError> {
     let n = rhs.len();
     if mass
         .iter()
         .chain(rhs)
         .chain(accumulated)
+        .chain(tolerances)
         .any(|value| !value.is_finite())
         || bounds
             .iter()
@@ -220,7 +330,7 @@ pub(crate) fn solve_bounded_rows(
                 + (0..n)
                     .map(|col| (mass[index * n + col] * current[col]).abs())
                     .sum::<f64>();
-            let tolerance = f64::from(8.0 * f32::EPSILON).max(256.0 * f64::EPSILON * scale);
+            let tolerance = tolerances[index].max(256.0 * f64::EPSILON * scale);
             let gradient = product - rhs[index];
             (active[index] == -1 && gradient < -tolerance)
                 || (active[index] == 1 && gradient > tolerance)
@@ -228,7 +338,23 @@ pub(crate) fn solve_bounded_rows(
         if let Some(index) = release {
             active[index] = 0;
         } else {
-            return Ok(current);
+            let total: Vec<_> = (0..n)
+                .map(|index| {
+                    if active[index] == -1 {
+                        bounds[index][0]
+                    } else if active[index] == 1 {
+                        bounds[index][1]
+                    } else {
+                        accumulated[index] + current[index]
+                    }
+                })
+                .collect();
+            let delta = total
+                .iter()
+                .zip(accumulated)
+                .map(|(total, old)| total - old)
+                .collect();
+            return Ok(BoundedRowSolution { delta, total });
         }
     }
 }
@@ -247,8 +373,9 @@ pub(crate) fn point_rows(
             linear2: axis,
             angular1: axis.cross(r1),
             angular2: r2.cross(axis),
-            error: separation[index],
-            compliance,
+            error: f64::from(separation[index]),
+            compliance: f64::from(compliance),
+            error_scale: coordinate_scale(&[r1, r2, separation]),
             ..Default::default()
         }
     })
@@ -344,8 +471,15 @@ mod tests {
             0.2467467550043163,
             -0.4124314008665573,
         ];
-        let result =
-            solve_bounded_rows(&mass, &rhs, &[[0.0, f64::INFINITY]; 3], &[0.0; 3]).unwrap();
+        let result = solve_bounded_rows(
+            &mass,
+            &rhs,
+            &[[0.0, f64::INFINITY]; 3],
+            &[0.0; 3],
+            &[1e-12; 3],
+        )
+        .unwrap()
+        .delta;
         assert!(result[0] > 0.0 && result[1] > 0.0 && result[2] == 0.0);
         for row in 0..3 {
             let gradient = (0..3)
@@ -363,7 +497,13 @@ mod tests {
     #[test]
     fn nonfinite_constraint_system_returns_a_typed_failure() {
         assert_eq!(
-            solve_bounded_rows(&[f64::NAN], &[0.0], &[[0.0, f64::INFINITY]], &[0.0]),
+            solve_bounded_rows(
+                &[f64::NAN],
+                &[0.0],
+                &[[0.0, f64::INFINITY]],
+                &[0.0],
+                &[1e-12]
+            ),
             Err(crate::dynamics::solver::xpbd::ConstraintSolveError::NonFiniteSystem)
         );
     }

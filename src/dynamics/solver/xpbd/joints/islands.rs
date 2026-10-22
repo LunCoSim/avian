@@ -4,12 +4,17 @@
 //! surfaces do not connect unrelated dynamic assemblies.
 use super::{
     fixed,
-    shared::{ConstraintRow, solve_bounded_rows},
+    shared::{
+        ConstraintRow, MotorConstraint, MotorInput, coordinate_scale, jacobian_dot,
+        projected_inverse_mass, solve_bounded_rows,
+    },
     *,
 };
 use crate::dynamics::{
     joints::EntityConstraint,
-    solver::xpbd::{ConstraintSolveError, ConstraintSolveFailure, XpbdSolverStatus},
+    solver::xpbd::{
+        ConstraintResidualKind, ConstraintSolveError, ConstraintSolveFailure, XpbdSolverStatus,
+    },
 };
 use crate::{
     dynamics::solver::{
@@ -33,9 +38,10 @@ struct Block {
     bodies: [SolverBodyIndex; 2],
     source: Source,
     bound: Option<(f32, [f64; 2])>,
+    motor: Option<MotorConstraint>,
 }
 impl Block {
-    fn rows(&mut self, bodies: [&SolverBody; 2]) -> [ConstraintRow; 6] {
+    fn frame_rows(&mut self, bodies: [&SolverBody; 2]) -> [ConstraintRow; 6] {
         let [a, b] = bodies;
         match &self.source {
             Source::Fixed(j, d) => {
@@ -45,11 +51,39 @@ impl Block {
             Source::Hinge(j, d) => j.frame_rows(a, b, d, &mut self.bound),
         }
     }
+    fn motor_input(&self, bodies: [&SolverBody; 2]) -> Option<MotorInput> {
+        match &self.source {
+            Source::Fixed(_, _) => None,
+            Source::Slider(j, d) => j.motor_input(bodies[0], bodies[1], d),
+            Source::Hinge(j, d) => j.motor_input(bodies[0], bodies[1], d),
+        }
+    }
+    fn rows(&mut self, bodies: [&SolverBody; 2]) -> impl Iterator<Item = ConstraintRow> + use<> {
+        let frames = self.frame_rows(bodies);
+        let motor = self.motor.as_ref().map(|motor| {
+            motor.row(
+                self.motor_input(bodies)
+                    .expect("prepared motor configuration is immutable during a solve"),
+            )
+        });
+        frames.into_iter().chain(motor)
+    }
     fn record(&mut self, rows: &[SpatialRow], update: &[f64]) {
         for (index, (row, impulse)) in rows.iter().zip(update).enumerate() {
             let impulse = *impulse as f32;
             let linear = row.row.linear2 * impulse;
             let angular = row.row.angular2 * impulse;
+            if index == 6 {
+                match &mut self.source {
+                    Source::Fixed(_, _) => unreachable!("fixed joints have no motor row"),
+                    Source::Slider(_, d) => {
+                        d.total_motor_lagrange += impulse;
+                        d.total_position_lagrange -= linear;
+                    }
+                    Source::Hinge(_, d) => d.total_motor_lagrange -= angular,
+                }
+                continue;
+            }
             match &mut self.source {
                 Source::Fixed(_, d) => {
                     if index < 3 {
@@ -83,6 +117,84 @@ struct SpatialRow {
     row: ConstraintRow,
     mobility: [bool; 2],
 }
+impl SpatialRow {
+    fn terms(&self) -> [(SolverBodyIndex, DVec3, DVec3); 2] {
+        let row = self;
+        [
+            (
+                row.bodies[0],
+                if row.mobility[0] {
+                    row.row.linear1.as_dvec3()
+                } else {
+                    DVec3::ZERO
+                },
+                if row.mobility[0] {
+                    row.row.angular1.as_dvec3()
+                } else {
+                    DVec3::ZERO
+                },
+            ),
+            (
+                row.bodies[1],
+                if row.mobility[1] {
+                    row.row.linear2.as_dvec3()
+                } else {
+                    DVec3::ZERO
+                },
+                if row.mobility[1] {
+                    row.row.angular2.as_dvec3()
+                } else {
+                    DVec3::ZERO
+                },
+            ),
+        ]
+    }
+    fn apply_dominance(&mut self, bodies: &SolverBodies) {
+        let a = bodies
+            .get_inertia(self.bodies[0])
+            .unwrap_or(&SolverBodyInertia::DUMMY);
+        let b = bodies
+            .get_inertia(self.bodies[1])
+            .unwrap_or(&SolverBodyInertia::DUMMY);
+        self.mobility = [
+            a.dominance() <= b.dominance(),
+            b.dominance() <= a.dominance(),
+        ];
+    }
+}
+fn inverse_mass_entry(bodies: &SolverBodies, a: &SpatialRow, b: &SpatialRow) -> f64 {
+    let mut value = 0.0;
+    for (body, linear, angular) in a.terms() {
+        if let Some(inertia) = bodies.get_inertia(body) {
+            for (other, other_linear, other_angular) in b.terms() {
+                if body == other {
+                    value +=
+                        jacobian_dot((linear, angular), (other_linear, other_angular), inertia);
+                }
+            }
+        }
+    }
+    value
+}
+fn projected_mobility(
+    bodies: &SolverBodies,
+    rows: &[SpatialRow],
+    motor: &SpatialRow,
+    dt: f32,
+) -> Result<f64, ConstraintSolveError> {
+    let n = rows.len();
+    let mut mass = vec![0.0; n * n];
+    let mut coupling = vec![0.0; n];
+    for (i, row) in rows.iter().enumerate() {
+        for (j, other) in rows.iter().enumerate() {
+            mass[i * n + j] = inverse_mass_entry(bodies, row, other);
+        }
+        mass[i * n + i] += row.row.compliance / f64::from(dt).powi(2);
+        coupling[i] = inverse_mass_entry(bodies, row, motor);
+    }
+    projected_inverse_mass(&mass, &coupling, inverse_mass_entry(bodies, motor, motor))
+}
+
 #[derive(Default)]
 struct Group {
     blocks: Vec<usize>,
@@ -127,6 +239,7 @@ pub(crate) fn solve_joint_contact_islands(
                 bodies: pair,
                 source,
                 bound: None,
+                motor: None,
             });
         }
     };
@@ -155,33 +268,6 @@ pub(crate) fn solve_joint_contact_islands(
         return;
     }
     blocks.sort_by_key(|b| b.entity);
-    // Apply each actuator once. Frame/contact refinements must not reapply a motor.
-    for block in &mut blocks {
-        let mut dummy1 = SolverBody::DUMMY;
-        let mut dummy2 = SolverBody::DUMMY;
-        let access = bodies.access();
-        // SAFETY: distinct valid indices were checked above; blocks run serially.
-        let (a, b) = unsafe { access.get_pair_unchecked_mut(block.bodies[0], block.bodies[1]) };
-        let (a, mut ia) = a.unwrap_or((&mut dummy1, &SolverBodyInertia::DUMMY));
-        let (b, mut ib) = b.unwrap_or((&mut dummy2, &SolverBodyInertia::DUMMY));
-        if ia.dominance() > ib.dominance() {
-            ia = &SolverBodyInertia::DUMMY;
-        } else if ib.dominance() > ia.dominance() {
-            ib = &SolverBodyInertia::DUMMY;
-        }
-        match &mut block.source {
-            Source::Fixed(_, _) => {}
-            Source::Slider(j, d) => j.apply_motor(a, b, ia, ib, d, dt),
-            Source::Hinge(j, d) => j.apply_motor(
-                a,
-                b,
-                ia.effective_inv_angular_inertia(),
-                ib.effective_inv_angular_inertia(),
-                d,
-                dt,
-            ),
-        }
-    }
     let body_islands: Vec<u32> = bodies
         .entities()
         .iter()
@@ -219,7 +305,70 @@ pub(crate) fn solve_joint_contact_islands(
         }
     }
     for group in groups.values() {
-        let count = group.blocks.len() * 6
+        // Normalize drives against the admitted bilateral mechanism, including
+        // loads carried through other joints, before nonlinear refinement.
+        let needs_mobility = group.blocks.iter().any(|index| {
+            let block = &blocks[*index];
+            block
+                .motor_input([
+                    bodies.get(block.bodies[0]).unwrap_or(&SolverBody::DUMMY),
+                    bodies.get(block.bodies[1]).unwrap_or(&SolverBody::DUMMY),
+                ])
+                .is_some_and(|input| input.normalized())
+        });
+        let mut mechanism = Vec::new();
+        for index in group.blocks.iter().filter(|_| needs_mobility) {
+            let block = &mut blocks[*index];
+            let a = bodies.get(block.bodies[0]).unwrap_or(&SolverBody::DUMMY);
+            let b = bodies.get(block.bodies[1]).unwrap_or(&SolverBody::DUMMY);
+            for row in block.frame_rows([a, b]) {
+                let mut row = SpatialRow {
+                    bodies: block.bodies,
+                    row,
+                    mobility: [true; 2],
+                };
+                row.apply_dominance(&bodies);
+                if row.row.bounds == [f64::NEG_INFINITY, f64::INFINITY] {
+                    mechanism.push(row);
+                }
+            }
+        }
+        for index in &group.blocks {
+            let block = &mut blocks[*index];
+            let a = bodies.get(block.bodies[0]).unwrap_or(&SolverBody::DUMMY);
+            let b = bodies.get(block.bodies[1]).unwrap_or(&SolverBody::DUMMY);
+            if let Some(input) = block.motor_input([a, b]) {
+                let mut motor_row = SpatialRow {
+                    bodies: block.bodies,
+                    row: input.jacobian.clone(),
+                    mobility: [true; 2],
+                };
+                motor_row.apply_dominance(&bodies);
+                let inverse_mass = if input.normalized() {
+                    projected_mobility(&bodies, &mechanism, &motor_row, dt)
+                } else {
+                    Ok(inverse_mass_entry(&bodies, &motor_row, &motor_row))
+                };
+                let prepared = inverse_mass.and_then(|mass| input.prepare(mass, dt));
+                match prepared {
+                    Ok(motor) => block.motor = motor,
+                    Err(reason) => {
+                        status.failure = Some(ConstraintSolveFailure {
+                            constraints: vec![block.entity],
+                            primary_entity: Some(block.entity),
+                            reason,
+                        });
+                        physics_time.pause();
+                        return;
+                    }
+                }
+            }
+        }
+        let count = group
+            .blocks
+            .iter()
+            .map(|index| 6 + usize::from(blocks[*index].motor.is_some()))
+            .sum::<usize>()
             + group
                 .contacts
                 .iter()
@@ -228,10 +377,12 @@ pub(crate) fn solve_joint_contact_islands(
         let mut accumulated = vec![0.0; count];
         for iteration in 0..=4 {
             let mut rows = Vec::with_capacity(count);
+            let mut ranges = Vec::with_capacity(group.blocks.len());
             for index in &group.blocks {
                 let block = &mut blocks[*index];
                 let a = bodies.get(block.bodies[0]).unwrap_or(&SolverBody::DUMMY);
                 let b = bodies.get(block.bodies[1]).unwrap_or(&SolverBody::DUMMY);
+                let start = rows.len();
                 for row in block.rows([a, b]) {
                     rows.push(SpatialRow {
                         bodies: block.bodies,
@@ -239,6 +390,7 @@ pub(crate) fn solve_joint_contact_islands(
                         mobility: [true; 2],
                     });
                 }
+                ranges.push(start..rows.len());
             }
             for index in &group.contacts {
                 let contact = &graph.colors[index.0].contact_constraints[index.1];
@@ -261,7 +413,14 @@ pub(crate) fn solve_joint_contact_islands(
                             linear2: contact.normal,
                             angular1: contact.normal.cross(r1),
                             angular2: r2.cross(contact.normal),
-                            error: separation,
+                            error: f64::from(separation),
+                            error_scale: coordinate_scale(&[
+                                r1,
+                                r2,
+                                a.delta_position,
+                                b.delta_position,
+                            ]) + f64::from(point.initial_separation.abs()),
+                            kind: ConstraintResidualKind::ContactNormal,
                             bounds: [0.0, f64::INFINITY],
                             ..default()
                         },
@@ -269,46 +428,54 @@ pub(crate) fn solve_joint_contact_islands(
                     });
                 }
             }
-            // Dominance removes mobility from the dominant endpoint only.
             for row in &mut rows {
-                let a = bodies
-                    .get_inertia(row.bodies[0])
-                    .unwrap_or(&SolverBodyInertia::DUMMY);
-                let b = bodies
-                    .get_inertia(row.bodies[1])
-                    .unwrap_or(&SolverBodyInertia::DUMMY);
-                if a.dominance() > b.dominance() {
-                    row.mobility[0] = false;
-                } else if b.dominance() > a.dominance() {
-                    row.mobility[1] = false;
-                }
+                row.apply_dominance(&bodies);
             }
-            // Stop nonlinear refinement once every active scalar constraint is
-            // satisfied to native f32 precision. Unloaded contacts may separate.
-            let tolerance = f64::from(8.0 * f32::EPSILON);
-            let converged = rows.iter().zip(&accumulated).all(|(row, &lambda)| {
-                let residual = f64::from(row.row.error)
-                    + f64::from(row.row.compliance) * lambda / f64::from(dt).powi(2);
-                if lambda == row.row.bounds[0] {
-                    residual >= -tolerance
-                } else if lambda == row.row.bounds[1] {
-                    residual <= tolerance
-                } else {
-                    residual.abs() <= tolerance
-                }
+            let worst = rows.iter().zip(&accumulated).enumerate().max_by(|a, b| {
+                (a.1.0.row.violation(*a.1.1, dt) / a.1.0.row.tolerance())
+                    .total_cmp(&(b.1.0.row.violation(*b.1.1, dt) / b.1.0.row.tolerance()))
             });
-            if converged {
+            let converged = rows
+                .iter()
+                .zip(&accumulated)
+                .all(|(row, &lambda)| row.row.violation(lambda, dt) <= row.row.tolerance());
+            // A drive must transmit effort every substep, even when its predicted
+            // coordinate change is smaller than the position residual tolerance.
+            if converged
+                && (iteration != 0
+                    || group
+                        .blocks
+                        .iter()
+                        .all(|index| blocks[*index].motor.is_none()))
+            {
                 break;
             }
             if iteration == 4 {
+                let (row, (failed, &lambda)) =
+                    worst.expect("a non-convergent island has constraint rows");
+                let primary_entity = ranges
+                    .iter()
+                    .position(|range| range.contains(&row))
+                    .map(|slot| blocks[group.blocks[slot]].entity)
+                    .or_else(|| {
+                        failed
+                            .bodies
+                            .iter()
+                            .find_map(|index| bodies.get_entity(*index))
+                    });
                 status.failure = Some(ConstraintSolveFailure {
                     constraints: group
                         .blocks
                         .iter()
                         .map(|index| blocks[*index].entity)
                         .collect(),
+                    primary_entity,
                     reason: ConstraintSolveError::NonlinearIterationLimit {
                         iterations: iteration,
+                        row,
+                        residual: failed.row.residual(lambda, dt),
+                        tolerance: failed.row.tolerance(),
+                        kind: failed.row.kind,
                     },
                 });
                 physics_time.pause();
@@ -323,6 +490,7 @@ pub(crate) fn solve_joint_contact_islands(
                             .iter()
                             .map(|index| blocks[*index].entity)
                             .collect(),
+                        primary_entity: None,
                         reason,
                     });
                     physics_time.pause();
@@ -330,12 +498,10 @@ pub(crate) fn solve_joint_contact_islands(
                 }
             };
             for (slot, index) in group.blocks.iter().enumerate() {
-                blocks[*index].record(
-                    &rows[slot * 6..slot * 6 + 6],
-                    &update[slot * 6..slot * 6 + 6],
-                );
+                let range = ranges[slot].clone();
+                blocks[*index].record(&rows[range.clone()], &update[range]);
             }
-            let mut cursor = group.blocks.len() * 6;
+            let mut cursor = ranges.last().map_or(0, |range| range.end);
             for index in &group.contacts {
                 for point in &mut graph.colors[index.0].contact_constraints[index.1].points {
                     let impulse = update[cursor] as f32 / dt;
@@ -364,53 +530,9 @@ fn solve_rows(
     let n = rows.len();
     let mut mass = vec![0.0; n * n];
     let mut rhs = vec![0.0; n];
-    let terms = |row: &SpatialRow| {
-        [
-            (
-                row.bodies[0],
-                if row.mobility[0] {
-                    row.row.linear1.as_dvec3()
-                } else {
-                    DVec3::ZERO
-                },
-                if row.mobility[0] {
-                    row.row.angular1.as_dvec3()
-                } else {
-                    DVec3::ZERO
-                },
-            ),
-            (
-                row.bodies[1],
-                if row.mobility[1] {
-                    row.row.linear2.as_dvec3()
-                } else {
-                    DVec3::ZERO
-                },
-                if row.mobility[1] {
-                    row.row.angular2.as_dvec3()
-                } else {
-                    DVec3::ZERO
-                },
-            ),
-        ]
-    };
     for (i, row) in rows.iter().enumerate() {
         for (j, other) in rows.iter().enumerate().take(i + 1) {
-            let mut value = 0.0;
-            for (body, linear, angular) in terms(row) {
-                if let Some(inertia) = bodies.get_inertia(body) {
-                    for (other_body, other_linear, other_angular) in terms(other) {
-                        if body == other_body {
-                            value += linear
-                                .dot(inertia.effective_inv_mass().as_dvec3() * other_linear)
-                                + angular.dot(
-                                    Mat3::from(inertia.effective_inv_angular_inertia()).as_dmat3()
-                                        * other_angular,
-                                );
-                        }
-                    }
-                }
-            }
+            let value = inverse_mass_entry(bodies, row, other);
             mass[i * n + j] = value;
             mass[j * n + i] = value;
         }
@@ -419,7 +541,9 @@ fn solve_rows(
         rhs[i] = -f64::from(row.row.error) - alpha * accumulated[i];
     }
     let bounds: Vec<_> = rows.iter().map(|row| row.row.bounds).collect();
-    let update = solve_bounded_rows(&mass, &rhs, &bounds, accumulated)?;
+    let tolerances: Vec<_> = rows.iter().map(|row| row.row.tolerance()).collect();
+    let solution = solve_bounded_rows(&mass, &rhs, &bounds, accumulated, &tolerances)?;
+    let update = &solution.delta;
     if update.iter().zip(rows).any(|(&impulse, row)| {
         !impulse.is_finite()
             || impulse.abs() > f64::from(f32::MAX)
@@ -441,8 +565,8 @@ fn solve_rows(
         core::iter::repeat_n(Vec3::ZERO, touched.len()).collect();
     let mut rotation = position.clone();
     for (index, row) in rows.iter().enumerate() {
-        accumulated[index] += update[index];
-        for (body, linear, angular) in terms(row) {
+        accumulated[index] = solution.total[index];
+        for (body, linear, angular) in row.terms() {
             if let Some(inertia) = bodies.get_inertia(body) {
                 let impulse = update[index];
                 position[touched
@@ -473,5 +597,5 @@ fn solve_rows(
                 (Quat::from_scaled_axis(rotation[slot]) * body.delta_rotation).normalize();
         }
     }
-    Ok(update)
+    Ok(solution.delta)
 }

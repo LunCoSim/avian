@@ -1550,3 +1550,133 @@ fn rejected_constraint_does_not_publish_partial_native_integration() {
         Vec3::X
     );
 }
+
+#[cfg(feature = "3d")]
+#[test]
+fn motor_stiffness_carries_load_transmitted_through_a_fixed_frame() {
+    for angular in [false, true] {
+        let mechanism_mass: f32 = if angular { 3.05 } else { 30.0 };
+        let omega = (40000.0 / mechanism_mass).sqrt();
+        for model in [
+            MotorModel::ForceBased {
+                stiffness: 40000.0,
+                damping: 4000.0,
+            },
+            MotorModel::AccelerationBased {
+                stiffness: 40000.0 / mechanism_mass,
+                damping: 4000.0 / mechanism_mass,
+            },
+            MotorModel::SpringDamper {
+                frequency: omega / core::f32::consts::TAU,
+                damping_ratio: 4000.0 / (2.0 * mechanism_mass * omega),
+            },
+        ] {
+            let mut app = create_app();
+            app.insert_resource(SubstepCount(8));
+            app.finish();
+            let anchor = app.world_mut().spawn(RigidBody::Static).id();
+            // Keep the mechanism awake to measure the drive's equilibrium,
+            // independently of the native island's idle-motion threshold.
+            let hub = app
+                .world_mut()
+                .spawn((
+                    RigidBody::Dynamic,
+                    SleepingDisabled,
+                    Position(RVector::ZERO),
+                    Mass(6.0),
+                    AngularInertia::new(Vec3::splat(0.05)),
+                ))
+                .id();
+            let load = app
+                .world_mut()
+                .spawn((
+                    RigidBody::Dynamic,
+                    SleepingDisabled,
+                    Position(RVector::ZERO),
+                    Mass(24.0),
+                    AngularInertia::new(Vec3::splat(3.0)),
+                ))
+                .id();
+            app.world_mut().spawn(FixedJoint::new(hub, load));
+            if angular {
+                app.world_mut()
+                    .entity_mut(load)
+                    .insert(ConstantTorque(Vec3::NEG_Y * 100.0));
+                app.world_mut().spawn(
+                    RevoluteJoint::new(anchor, hub)
+                        .with_hinge_axis(Vec3::Y)
+                        .with_angle_limits(-1.0, 1.0)
+                        .with_motor(AngularMotor {
+                            target_position: 0.06,
+                            max_torque: 1000.0,
+                            motor_model: model,
+                            ..default()
+                        }),
+                );
+            } else {
+                app.world_mut()
+                    .entity_mut(load)
+                    .insert(ConstantForce(Vec3::NEG_Y * 100.0));
+                app.world_mut().spawn(
+                    PrismaticJoint::new(anchor, hub)
+                        .with_slider_axis(Vec3::Y)
+                        .with_limits(-1.0, 1.0)
+                        .with_motor(LinearMotor {
+                            target_position: 0.06,
+                            max_force: 1000.0,
+                            motor_model: model,
+                            ..default()
+                        }),
+                );
+            }
+            for _ in 0..128 {
+                app.update();
+            }
+            let coordinate = if angular {
+                app.world()
+                    .get::<Rotation>(hub)
+                    .unwrap()
+                    .0
+                    .to_euler(EulerRot::YXZ)
+                    .0
+            } else {
+                app.world().get::<Position>(hub).unwrap().y as f32
+            };
+            let expected = 0.06 - 100.0 / 40000.0;
+            assert!(
+                (coordinate - expected).abs() < 0.0001,
+                "drive must retain physical stiffness across the attached load: angular={angular}, model={model:?}, measured={coordinate}, expected={expected}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "3d")]
+#[test]
+fn joint_topology_changes_preserve_contact_velocity_projection() {
+    let mut app = create_app();
+    app.finish();
+    let bodies: [_; 3] = core::array::from_fn(|_| app.world_mut().spawn(RigidBody::Dynamic).id());
+    let joint = app
+        .world_mut()
+        .spawn(FixedJoint::new(bodies[0], bodies[1]))
+        .id();
+    app.update();
+    app.world_mut()
+        .entity_mut(joint)
+        .insert(FixedJoint::new(bodies[0], bodies[2]));
+    app.update();
+    for body in bodies {
+        assert!(app.world().get::<XpbdVelocityProjection>(body).is_some());
+    }
+    app.world_mut().entity_mut(joint).insert(JointDisabled);
+    app.update();
+    for body in bodies {
+        assert!(app.world().get::<XpbdVelocityProjection>(body).is_some());
+    }
+    app.world_mut().despawn(joint);
+    app.update();
+    for body in bodies {
+        assert!(app.world().get::<XpbdVelocityProjection>(body).is_some());
+    }
+}

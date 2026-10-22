@@ -173,7 +173,11 @@ mod tests {
             impulse: 0.0,
             total_impulse: 0.0,
             effective_mass: 2.0,
-            softness: SoftnessCoefficients::default(),
+            softness: SoftnessCoefficients {
+                bias: 0.0,
+                mass_scale: 1.0,
+                impulse_scale: 0.0,
+            },
         };
         let mut relative = -3.0;
         let mut applied = 0.0;

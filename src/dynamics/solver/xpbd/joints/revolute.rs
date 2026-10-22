@@ -16,6 +16,10 @@ use core::f32::consts::{PI, TAU};
 #[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
 #[reflect(Component, Debug, PartialEq)]
 pub struct RevoluteJointSolverData {
+    #[cfg(feature = "3d")]
+    #[reflect(ignore)]
+    #[cfg_attr(feature = "serialize", serde(skip))]
+    pub(super) velocity_cache: super::shared::VelocityRowCache,
     pub(super) point_constraint: PointConstraintShared,
     #[cfg(feature = "2d")]
     pub(super) rotation_difference: f32,
@@ -164,6 +168,51 @@ impl XpbdConstraint<2> for RevoluteJoint {
         solver_data
             .point_constraint
             .solve([body1, body2], inertias, self.point_compliance, dt);
+    }
+    #[cfg(feature = "3d")]
+    fn prepare_velocity_projection(
+        &mut self,
+        bodies: [&SolverBody; 2],
+        inertias: [&SolverBodyInertia; 2],
+        data: &mut RevoluteJointSolverData,
+    ) {
+        let [a, b] = bodies;
+        let r1 = a.delta_rotation * data.point_constraint.world_r1;
+        let r2 = b.delta_rotation * data.point_constraint.world_r2;
+        let axis1 = a.delta_rotation * data.a1;
+        let axis2 = b.delta_rotation * data.a2;
+        let tangent2 = b.delta_rotation * data.b2;
+        let mut rows = core::array::from_fn(|_| super::shared::ConstraintRow::default());
+        if self.point_compliance == 0.0 {
+            for (i, n) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
+                rows[i].linear1 = -n;
+                rows[i].linear2 = n;
+                rows[i].angular1 = n.cross(r1);
+                rows[i].angular2 = r2.cross(n);
+            }
+        }
+        if self.align_compliance == 0.0 {
+            for (i, tangent) in [tangent2, axis2.cross(tangent2)].into_iter().enumerate() {
+                let gradient = axis1.cross(tangent);
+                rows[i + 3].angular1 = gradient;
+                rows[i + 3].angular2 = -gradient;
+            }
+        }
+        super::shared::prepare_velocity_rows(inertias, &rows, &mut data.velocity_cache);
+    }
+    #[cfg(feature = "3d")]
+    fn project_velocities(
+        &mut self,
+        bodies: [&mut SolverBody; 2],
+        _inertias: [&SolverBodyInertia; 2],
+        data: &mut RevoluteJointSolverData,
+        dt: f32,
+    ) {
+        let impulse = super::shared::solve_velocity_rows(bodies, &data.velocity_cache);
+        data.point_constraint.total_lagrange -= dt * Vec3::new(impulse[0], impulse[1], impulse[2]);
+        data.total_align_lagrange -= dt
+            * (data.velocity_cache.gradients[3][3] * impulse[3]
+                + data.velocity_cache.gradients[4][3] * impulse[4]);
     }
 }
 

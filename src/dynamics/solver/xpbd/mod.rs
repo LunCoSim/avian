@@ -295,8 +295,8 @@
 
 mod plugin;
 pub use plugin::{
-    XpbdSolverPlugin, XpbdSolverSystems, XpbdVelocityProjection, prepare_xpbd_joint,
-    solve_xpbd_joint,
+    JointVelocitySolverConfig, XpbdSolverPlugin, XpbdSolverSystems, XpbdVelocityProjection,
+    prepare_xpbd_joint, solve_xpbd_joint,
 };
 
 pub mod joints;
@@ -369,6 +369,27 @@ pub trait XpbdConstraint<const ENTITY_COUNT: usize> {
         solver_data: &mut Self::SolverData,
         dt: f32,
     );
+    /// Prepares hard velocity gradients after positional projection. The solver
+    /// calls this once per substep before iterative velocity projection, with
+    /// poses and inertias held fixed throughout that relaxation loop.
+    fn prepare_velocity_projection(
+        &mut self,
+        _bodies: [&SolverBody; ENTITY_COUNT],
+        _inertias: [&SolverBodyInertia; ENTITY_COUNT],
+        _solver_data: &mut Self::SolverData,
+    ) {
+    }
+
+    /// Projects velocities onto hard constraint gradients after positional projection.
+    /// Compliant degrees of freedom retain their constitutive dynamics.
+    fn project_velocities(
+        &mut self,
+        _bodies: [&mut SolverBody; ENTITY_COUNT],
+        _inertias: [&SolverBodyInertia; ENTITY_COUNT],
+        _solver_data: &mut Self::SolverData,
+        _dt: f32,
+    ) {
+    }
 }
 
 /// Computes how much a constraint's [Lagrange multiplier](self#lagrange-multipliers) changes when projecting

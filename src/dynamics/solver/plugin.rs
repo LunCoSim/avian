@@ -860,23 +860,44 @@ fn solve_contacts<const USE_BIAS: bool>(
     mut diagnostics: ResMut<SolverDiagnostics>,
 ) {
     let start = crate::utils::Instant::now();
+    solve_contacts_graph::<USE_BIAS>(
+        &mut solver_bodies,
+        &mut constraint_graph,
+        &solver_config,
+        length_unit.0,
+        time.delta_secs(),
+        |_| true,
+    );
+    if USE_BIAS {
+        diagnostics.solve_constraints += start.elapsed();
+    } else {
+        diagnostics.relax_velocities += start.elapsed();
+    }
+}
 
-    let delta_secs = time.delta_secs();
-    let max_overlap_solve_speed = solver_config.max_overlap_solve_speed * length_unit.0;
-
+pub(crate) fn solve_contacts_graph<const USE_BIAS: bool>(
+    solver_bodies: &mut SolverBodies,
+    constraint_graph: &mut ConstraintGraph,
+    solver_config: &SolverConfig,
+    length_unit: f32,
+    delta_secs: f32,
+    accept: impl Fn(&ContactConstraint) -> bool + Sync,
+) {
+    let max_overlap_solve_speed = solver_config.max_overlap_solve_speed * length_unit;
     let access = solver_bodies.access();
-
     // Solve overflow constraints serially. They have lower priority, so they are solved first.
     for constraint in constraint_graph.colors[COLOR_OVERFLOW_INDEX]
         .contact_constraints
         .iter_mut()
     {
-        solve_contacts_internal::<USE_BIAS>(
-            &access,
-            constraint,
-            max_overlap_solve_speed,
-            delta_secs,
-        );
+        if accept(constraint) {
+            solve_contacts_internal::<USE_BIAS>(
+                &access,
+                constraint,
+                max_overlap_solve_speed,
+                delta_secs,
+            );
+        }
     }
 
     // Solve contact constraints in each color in parallel.
@@ -887,6 +908,9 @@ fn solve_contacts<const USE_BIAS: bool>(
         .filter(|color| !color.contact_constraints.is_empty())
     {
         crate::utils::par_for_each(&mut color.contact_constraints, 64, |_i, constraint| {
+            if !accept(constraint) {
+                return;
+            }
             solve_contacts_internal::<USE_BIAS>(
                 &access,
                 constraint,
@@ -894,12 +918,6 @@ fn solve_contacts<const USE_BIAS: bool>(
                 delta_secs,
             );
         });
-    }
-
-    if USE_BIAS {
-        diagnostics.solve_constraints += start.elapsed();
-    } else {
-        diagnostics.relax_velocities += start.elapsed();
     }
 }
 

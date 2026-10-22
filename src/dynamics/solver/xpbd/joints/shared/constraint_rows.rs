@@ -123,46 +123,160 @@ pub(crate) fn solve_constraint_rows(
     impulses
 }
 
+/// Prepare hard velocity gradients and their mass-weighted responses once after
+/// positional projection. Poses and inertias stay fixed during velocity relaxation.
+pub(crate) fn prepare_velocity_rows(
+    inertias: [&SolverBodyInertia; 2],
+    rows: &[ConstraintRow; 6],
+    cache: &mut VelocityRowCache,
+) {
+    let [ia, ib] = inertias;
+    let ma = ia.effective_inv_mass();
+    let mb = ib.effective_inv_mass();
+    let aa = ia.effective_inv_angular_inertia();
+    let ab = ib.effective_inv_angular_inertia();
+    cache.gradients = core::array::from_fn(|i| {
+        [
+            rows[i].linear1,
+            rows[i].linear2,
+            rows[i].angular1,
+            rows[i].angular2,
+        ]
+    });
+    cache.responses = core::array::from_fn(|i| {
+        [
+            ma * rows[i].linear1,
+            mb * rows[i].linear2,
+            aa * rows[i].angular1,
+            ab * rows[i].angular2,
+        ]
+    });
+    let matrix = core::array::from_fn(|i| {
+        core::array::from_fn(|j| {
+            let row = cache.gradients[i];
+            let response = cache.responses[j];
+            f64::from(
+                row[0].dot(response[0])
+                    + row[1].dot(response[1])
+                    + row[2].dot(response[2])
+                    + row[3].dot(response[3]),
+            )
+        })
+    });
+    cache.factor = MobileMassFactor::new(matrix);
+}
+
+/// Project hard velocity gradients using their prepared constrained effective mass.
+/// The impulse changes velocities only; it cannot repair or overwrite a pose.
+pub(crate) fn solve_velocity_rows(
+    bodies: [&mut SolverBody; 2],
+    cache: &VelocityRowCache,
+) -> [f32; 6] {
+    let [a, b] = bodies;
+    let rhs = core::array::from_fn(|i| {
+        let row = cache.gradients[i];
+        -f64::from(
+            row[0].dot(a.linear_velocity)
+                + row[1].dot(b.linear_velocity)
+                + row[2].dot(a.angular_velocity)
+                + row[3].dot(b.angular_velocity),
+        )
+    });
+    let result = cache.factor.solve(rhs).map(|x| x as f32);
+    for (response, lambda) in cache.responses.iter().zip(result) {
+        a.linear_velocity += response[0] * lambda;
+        b.linear_velocity += response[1] * lambda;
+        a.angular_velocity += response[2] * lambda;
+        b.angular_velocity += response[3] * lambda;
+    }
+    result
+}
+
 // A rank-revealing symmetric elimination is required for valid locked axes.
 // glam_matrix_extras' 6x6 LDLT divides by zero for these semidefinite systems.
 // Null rows carry no mobility and therefore apply no physical correction.
 #[cfg(feature = "3d")]
-pub(crate) fn solve_mobile_rows(mut matrix: [[f64; 6]; 6], mut rhs: [f64; 6]) -> [f64; 6] {
-    let mut order = [0, 1, 2, 3, 4, 5];
-    let scale = (0..6).map(|i| matrix[i][i]).fold(0.0_f64, f64::max);
-    let tolerance = 64.0 * f64::EPSILON * scale;
-    let mut rank = 0;
-    for pivot in 0..6 {
-        let selected = (pivot..6)
-            .max_by(|&a, &b| matrix[a][a].total_cmp(&matrix[b][b]))
-            .unwrap();
-        if matrix[selected][selected] <= tolerance {
-            break;
-        }
-        matrix.swap(pivot, selected);
-        for row in &mut matrix {
-            row.swap(pivot, selected);
-        }
-        rhs.swap(pivot, selected);
-        order.swap(pivot, selected);
-        for row in pivot + 1..6 {
-            let factor = matrix[row][pivot] / matrix[pivot][pivot];
-            for col in pivot + 1..6 {
-                matrix[row][col] -= factor * matrix[pivot][col];
+pub(crate) fn solve_mobile_rows(matrix: [[f64; 6]; 6], rhs: [f64; 6]) -> [f64; 6] {
+    MobileMassFactor::new(matrix).solve(rhs)
+}
+
+/// Pivoted LDLᵀ of the mobile constraint subspace; null rows exert no impulse.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct MobileMassFactor {
+    matrix: [[f64; 6]; 6],
+    order: [usize; 6],
+    rank: usize,
+}
+impl MobileMassFactor {
+    fn new(mut matrix: [[f64; 6]; 6]) -> Self {
+        let mut order = [0, 1, 2, 3, 4, 5];
+        let mut rank = 0;
+        let scale = (0..6).map(|i| matrix[i][i]).fold(0.0_f64, f64::max);
+        let tolerance = 64.0 * f64::EPSILON * scale;
+        for pivot in 0..6 {
+            let selected = (pivot..6)
+                .max_by(|&a, &b| matrix[a][a].total_cmp(&matrix[b][b]))
+                .unwrap();
+            if matrix[selected][selected] <= tolerance {
+                break;
             }
-            rhs[row] -= factor * rhs[pivot];
-            matrix[row][pivot] = 0.0;
+            matrix.swap(pivot, selected);
+            for row in &mut matrix {
+                row.swap(pivot, selected);
+            }
+            order.swap(pivot, selected);
+            let diagonal = matrix[pivot][pivot];
+            let mut factors = [0.0; 6];
+            for row in pivot + 1..6 {
+                factors[row] = matrix[row][pivot] / diagonal;
+            }
+            for row in pivot + 1..6 {
+                for col in row..6 {
+                    matrix[col][row] -= factors[row] * matrix[col][pivot];
+                    matrix[row][col] = matrix[col][row];
+                }
+            }
+            for row in pivot + 1..6 {
+                matrix[row][pivot] = factors[row];
+            }
+            rank += 1;
         }
-        rank += 1;
+        Self {
+            matrix,
+            order,
+            rank,
+        }
     }
-    let mut result = [0.0; 6];
-    for row in (0..rank).rev() {
-        let tail: f64 = (row + 1..rank)
-            .map(|col| matrix[row][col] * result[order[col]])
-            .sum();
-        result[order[row]] = (rhs[row] - tail) / matrix[row][row];
+    fn solve(&self, rhs: [f64; 6]) -> [f64; 6] {
+        let mut value = [0.0; 6];
+        for row in 0..self.rank {
+            value[row] = rhs[self.order[row]]
+                - (0..row)
+                    .map(|col| self.matrix[row][col] * value[col])
+                    .sum::<f64>();
+        }
+        for (row, value) in value.iter_mut().enumerate().take(self.rank) {
+            *value /= self.matrix[row][row];
+        }
+        for row in (0..self.rank).rev() {
+            value[row] -= (row + 1..self.rank)
+                .map(|col| self.matrix[col][row] * value[col])
+                .sum::<f64>();
+        }
+        let mut result = [0.0; 6];
+        for row in 0..self.rank {
+            result[self.order[row]] = value[row];
+        }
+        result
     }
-    result
+}
+
+/// Substep-local gradients, responses and factorization for velocity relaxation.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct VelocityRowCache {
+    pub(crate) gradients: [[Vec3; 4]; 6],
+    responses: [[Vec3; 4]; 6],
+    factor: MobileMassFactor,
 }
 
 #[cfg(all(test, feature = "3d"))]

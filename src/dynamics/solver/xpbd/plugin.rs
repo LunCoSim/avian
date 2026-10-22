@@ -20,6 +20,18 @@ pub struct XpbdSolverPlugin;
 impl Plugin for XpbdSolverPlugin {
     fn build(&self, app: &mut App) {
         app.register_type::<XpbdVelocityProjection>();
+        #[cfg(feature = "3d")]
+        {
+            app.init_resource::<JointVelocitySolverConfig>()
+                .register_type::<JointVelocitySolverConfig>();
+            app.add_systems(
+                SubstepSchedule,
+                relax_joint_contact_velocities
+                    .after(XpbdSolverSystems::VelocityProjection)
+                    .before(SubstepSolverSystems::Damping)
+                    .run_if(has_rigid_joint_velocity_constraints),
+            );
+        }
 
         app.register_required_components::<FixedJoint, FixedJointSolverData>();
         app.register_required_components::<RevoluteJoint, RevoluteJointSolverData>();
@@ -97,6 +109,168 @@ impl Plugin for XpbdSolverPlugin {
     }
 }
 
+/// Number of coupled joint/contact velocity relaxation passes per substep.
+#[derive(Resource, Reflect)]
+#[reflect(Resource)]
+pub struct JointVelocitySolverConfig {
+    /// Fixed number of contact/joint passes, in addition to the native relaxation pass.
+    pub iterations: core::num::NonZeroU8,
+}
+impl Default for JointVelocitySolverConfig {
+    fn default() -> Self {
+        Self {
+            iterations: core::num::NonZeroU8::new(16).unwrap(),
+        }
+    }
+}
+#[cfg(feature = "3d")]
+fn has_rigid_joint_velocity_constraints(
+    joints: Query<
+        (
+            Option<&FixedJoint>,
+            Option<&PrismaticJoint>,
+            Option<&RevoluteJoint>,
+        ),
+        (
+            Or<(With<FixedJoint>, With<PrismaticJoint>, With<RevoluteJoint>)>,
+            Without<JointDisabled>,
+        ),
+    >,
+    active: Query<(&RigidBody, &SolverBodyIndex), (Without<Sleeping>, Without<RigidBodyDisabled>)>,
+) -> bool {
+    joints.iter().any(|(fixed, slider, hinge)| {
+        let bodies = if let Some(joint) = fixed {
+            joint.entities()
+        } else if let Some(joint) = slider {
+            joint.entities()
+        } else {
+            hinge.unwrap().entities()
+        };
+        bodies.into_iter().any(|body| {
+            active
+                .get(body)
+                .is_ok_and(|(body, index)| body.is_dynamic() && index.is_valid())
+        })
+    })
+}
+
+#[cfg(feature = "3d")]
+fn relax_joint_contact_velocities(
+    mut solver_bodies: ResMut<SolverBodies>,
+    body_indices: Query<Option<&SolverBodyIndex>, (With<RigidBody>, Without<RigidBodyDisabled>)>,
+    mut fixed: Query<
+        (&mut FixedJoint, &mut FixedJointSolverData),
+        (Without<RigidBody>, Without<JointDisabled>),
+    >,
+    mut sliders: Query<
+        (&mut PrismaticJoint, &mut PrismaticJointSolverData),
+        (Without<RigidBody>, Without<JointDisabled>),
+    >,
+    mut hinges: Query<
+        (&mut RevoluteJoint, &mut RevoluteJointSolverData),
+        (Without<RigidBody>, Without<JointDisabled>),
+    >,
+    mut graph: ResMut<crate::dynamics::solver::constraint_graph::ConstraintGraph>,
+    islands: Res<crate::dynamics::solver::islands::PhysicsIslands>,
+    body_islands: Query<&crate::dynamics::solver::islands::BodyIslandNode>,
+    config: Res<crate::dynamics::solver::SolverConfig>,
+    iterations: Res<JointVelocitySolverConfig>,
+    length_unit: Res<PhysicsLengthUnit>,
+    time: Res<Time>,
+    mut diagnostics: ResMut<crate::dynamics::solver::SolverDiagnostics>,
+) {
+    let dt = time.delta_secs();
+    let mut coupled_islands: smallvec::SmallVec<[_; 8]> = fixed
+        .iter()
+        .map(|(joint, _)| joint.entities())
+        .chain(sliders.iter().map(|(joint, _)| joint.entities()))
+        .chain(hinges.iter().map(|(joint, _)| joint.entities()))
+        .flatten()
+        .filter_map(|body| body_islands.get(body).ok().map(|node| node.island_id()))
+        .collect();
+    coupled_islands.sort_unstable();
+    coupled_islands.dedup();
+    apply_xpbd_joint_pass::<FixedJoint>(
+        &mut solver_bodies,
+        &body_indices,
+        &mut fixed,
+        dt,
+        JointSolverPhase::PrepareVelocities,
+    );
+    apply_xpbd_joint_pass::<PrismaticJoint>(
+        &mut solver_bodies,
+        &body_indices,
+        &mut sliders,
+        dt,
+        JointSolverPhase::PrepareVelocities,
+    );
+    apply_xpbd_joint_pass::<RevoluteJoint>(
+        &mut solver_bodies,
+        &body_indices,
+        &mut hinges,
+        dt,
+        JointSolverPhase::PrepareVelocities,
+    );
+    apply_xpbd_joint_pass::<FixedJoint>(
+        &mut solver_bodies,
+        &body_indices,
+        &mut fixed,
+        dt,
+        JointSolverPhase::ProjectVelocities,
+    );
+    apply_xpbd_joint_pass::<PrismaticJoint>(
+        &mut solver_bodies,
+        &body_indices,
+        &mut sliders,
+        dt,
+        JointSolverPhase::ProjectVelocities,
+    );
+    apply_xpbd_joint_pass::<RevoluteJoint>(
+        &mut solver_bodies,
+        &body_indices,
+        &mut hinges,
+        dt,
+        JointSolverPhase::ProjectVelocities,
+    );
+    for _ in 0..iterations.iterations.get() {
+        let start = crate::utils::Instant::now();
+        crate::dynamics::solver::plugin::solve_contacts_graph::<false>(
+            &mut solver_bodies,
+            &mut graph,
+            &config,
+            length_unit.0,
+            dt,
+            |contact| {
+                islands
+                    .contact_node(contact.contact_id)
+                    .is_some_and(|node| coupled_islands.binary_search(&node.island_id()).is_ok())
+            },
+        );
+        diagnostics.relax_velocities += start.elapsed();
+        apply_xpbd_joint_pass::<FixedJoint>(
+            &mut solver_bodies,
+            &body_indices,
+            &mut fixed,
+            dt,
+            JointSolverPhase::ProjectVelocities,
+        );
+        apply_xpbd_joint_pass::<PrismaticJoint>(
+            &mut solver_bodies,
+            &body_indices,
+            &mut sliders,
+            dt,
+            JointSolverPhase::ProjectVelocities,
+        );
+        apply_xpbd_joint_pass::<RevoluteJoint>(
+            &mut solver_bodies,
+            &body_indices,
+            &mut hinges,
+            dt,
+            JointSolverPhase::ProjectVelocities,
+        );
+    }
+}
+
 /// System sets for the XPBD constraint solver in the [`SubstepSchedule`].
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum XpbdSolverSystems {
@@ -155,14 +329,39 @@ pub fn solve_xpbd_joint<
 ) where
     C::SolverData: Component<Mutability = Mutable>,
 {
-    let delta_secs = time.delta_secs();
+    apply_xpbd_joint_pass::<C>(
+        &mut solver_bodies,
+        &body_indices,
+        &mut joints,
+        time.delta_secs(),
+        JointSolverPhase::Position,
+    );
+}
 
+#[derive(Clone, Copy)]
+enum JointSolverPhase {
+    Position,
+    PrepareVelocities,
+    ProjectVelocities,
+}
+
+fn apply_xpbd_joint_pass<
+    C: Component<Mutability = Mutable> + EntityConstraint<2> + XpbdConstraint<2>,
+>(
+    solver_bodies: &mut SolverBodies,
+    body_indices: &Query<Option<&SolverBodyIndex>, (With<RigidBody>, Without<RigidBodyDisabled>)>,
+    joints: &mut Query<(&mut C, &mut C::SolverData), (Without<RigidBody>, Without<JointDisabled>)>,
+    delta_secs: f32,
+    phase: JointSolverPhase,
+) where
+    C::SolverData: Component<Mutability = Mutable>,
+{
     let access = solver_bodies.access();
 
     let mut dummy_body1 = SolverBody::default();
     let mut dummy_body2 = SolverBody::default();
 
-    for (mut joint, mut solver_data) in &mut joints {
+    for (mut joint, mut solver_data) in joints.iter_mut() {
         let [entity1, entity2] = joint.entities();
 
         let Ok([index1, index2]) = body_indices.get_many([entity1, entity2]) else {
@@ -198,12 +397,25 @@ pub fn solve_xpbd_joint<
             _ => {}
         }
 
-        joint.solve(
-            [body1, body2],
-            [inertia1, inertia2],
-            &mut solver_data,
-            delta_secs,
-        );
+        match phase {
+            JointSolverPhase::PrepareVelocities => joint.prepare_velocity_projection(
+                [body1, body2],
+                [inertia1, inertia2],
+                &mut solver_data,
+            ),
+            JointSolverPhase::ProjectVelocities => joint.project_velocities(
+                [body1, body2],
+                [inertia1, inertia2],
+                &mut solver_data,
+                delta_secs,
+            ),
+            JointSolverPhase::Position => joint.solve(
+                [body1, body2],
+                [inertia1, inertia2],
+                &mut solver_data,
+                delta_secs,
+            ),
+        }
     }
 }
 

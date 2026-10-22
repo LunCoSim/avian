@@ -16,6 +16,10 @@ use bevy::prelude::*;
 pub struct FixedJointSolverData {
     pub(super) point_constraint: PointConstraintShared,
     pub(super) angle_constraint: FixedAngleConstraintShared,
+    #[cfg(feature = "3d")]
+    #[reflect(ignore)]
+    #[cfg_attr(feature = "serialize", serde(skip))]
+    pub(super) velocity_cache: super::shared::VelocityRowCache,
 }
 
 impl XpbdConstraintSolverData for FixedJointSolverData {
@@ -97,6 +101,43 @@ impl XpbdConstraint<2> for FixedJoint {
             self.angle_compliance,
             dt,
         );
+    }
+    #[cfg(feature = "3d")]
+    fn prepare_velocity_projection(
+        &mut self,
+        bodies: [&SolverBody; 2],
+        inertias: [&SolverBodyInertia; 2],
+        data: &mut FixedJointSolverData,
+    ) {
+        let [a, b] = bodies;
+        let r1 = a.delta_rotation * data.point_constraint.world_r1;
+        let r2 = b.delta_rotation * data.point_constraint.world_r2;
+        let mut rows = core::array::from_fn(|_| super::shared::ConstraintRow::default());
+        for (i, n) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
+            if self.point_compliance == 0.0 {
+                rows[i].linear1 = -n;
+                rows[i].linear2 = n;
+                rows[i].angular1 = n.cross(r1);
+                rows[i].angular2 = r2.cross(n);
+            }
+            if self.angle_compliance == 0.0 {
+                rows[i + 3].angular1 = -n;
+                rows[i + 3].angular2 = n;
+            }
+        }
+        super::shared::prepare_velocity_rows(inertias, &rows, &mut data.velocity_cache);
+    }
+    #[cfg(feature = "3d")]
+    fn project_velocities(
+        &mut self,
+        bodies: [&mut SolverBody; 2],
+        _inertias: [&SolverBodyInertia; 2],
+        data: &mut FixedJointSolverData,
+        dt: f32,
+    ) {
+        let impulse = super::shared::solve_velocity_rows(bodies, &data.velocity_cache);
+        data.point_constraint.total_lagrange -= dt * Vec3::new(impulse[0], impulse[1], impulse[2]);
+        data.angle_constraint.total_lagrange -= dt * Vec3::new(impulse[3], impulse[4], impulse[5]);
     }
 }
 

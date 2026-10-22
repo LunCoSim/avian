@@ -22,6 +22,10 @@ pub struct PrismaticJointSolverData {
     pub(super) angle_constraint: FixedAngleConstraintShared,
     /// Accumulated motor Lagrange multiplier for this frame.
     pub(super) total_motor_lagrange: f32,
+    #[cfg(feature = "3d")]
+    #[reflect(ignore)]
+    #[cfg_attr(feature = "serialize", serde(skip))]
+    pub(super) velocity_cache: super::shared::VelocityRowCache,
 }
 
 impl XpbdConstraintSolverData for PrismaticJointSolverData {
@@ -104,6 +108,51 @@ impl XpbdConstraint<2> for PrismaticJoint {
         self.constrain_positions(body1, body2, inertias[0], inertias[1], solver_data, dt);
         #[cfg(feature = "3d")]
         self.constrain_frames([body1, body2], inertias, solver_data, dt);
+    }
+    #[cfg(feature = "3d")]
+    fn prepare_velocity_projection(
+        &mut self,
+        bodies: [&SolverBody; 2],
+        inertias: [&SolverBodyInertia; 2],
+        data: &mut PrismaticJointSolverData,
+    ) {
+        let [a, b] = bodies;
+        let r1 = a.delta_rotation * data.world_r1;
+        let r2 = b.delta_rotation * data.world_r2;
+        let separation = b.delta_position - a.delta_position + r2 - r1 + data.center_difference;
+        let axis = a.delta_rotation * data.free_axis1;
+        let tangent = axis.any_orthonormal_vector();
+        let bitangent = axis.cross(tangent);
+        let mut rows = core::array::from_fn(|_| super::shared::ConstraintRow::default());
+        for (i, n) in [tangent, bitangent].into_iter().enumerate() {
+            if self.align_compliance == 0.0 {
+                rows[i].linear1 = -n;
+                rows[i].linear2 = n;
+                rows[i].angular1 = n.cross(r1 + separation);
+                rows[i].angular2 = r2.cross(n);
+            }
+        }
+        for (i, n) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
+            if self.angle_compliance == 0.0 {
+                rows[i + 3].angular1 = -n;
+                rows[i + 3].angular2 = n;
+            }
+        }
+        super::shared::prepare_velocity_rows(inertias, &rows, &mut data.velocity_cache);
+    }
+    #[cfg(feature = "3d")]
+    fn project_velocities(
+        &mut self,
+        bodies: [&mut SolverBody; 2],
+        _inertias: [&SolverBodyInertia; 2],
+        data: &mut PrismaticJointSolverData,
+        dt: f32,
+    ) {
+        let impulse = super::shared::solve_velocity_rows(bodies, &data.velocity_cache);
+        let tangent = data.velocity_cache.gradients[0][1];
+        let bitangent = data.velocity_cache.gradients[1][1];
+        data.total_position_lagrange -= dt * (tangent * impulse[0] + bitangent * impulse[1]);
+        data.angle_constraint.total_lagrange -= dt * Vec3::new(impulse[3], impulse[4], impulse[5]);
     }
 }
 

@@ -82,14 +82,32 @@ pub(crate) fn update_child_collider_position(
             continue;
         };
 
-        position.0 = rb_pos.0 + (rb_rot * collider_transform.translation).real();
+        let next_position = rb_pos.0 + (rb_rot * collider_transform.translation).real();
+        // Stationary child colliders must retain their change ticks so the
+        // collider tree can skip recomputing their bounds. Compare bits to
+        // preserve signed zeros and non-finite payloads at this boundary.
+        if position.0.to_array().map(|value| value.to_bits())
+            != next_position.to_array().map(|value| value.to_bits())
+        {
+            position.0 = next_position;
+        }
         #[cfg(feature = "2d")]
         {
-            *rotation = (Rot2::from(*rb_rot) * collider_transform.rotation).into();
+            let next_rotation: Rotation =
+                (Rot2::from(*rb_rot) * collider_transform.rotation).into();
+            if rotation.cos.to_bits() != next_rotation.cos.to_bits()
+                || rotation.sin.to_bits() != next_rotation.sin.to_bits()
+            {
+                *rotation = next_rotation;
+            }
         }
         #[cfg(feature = "3d")]
         {
-            *rotation = (rb_rot.0 * collider_transform.rotation).normalize().into();
+            let next_rotation = (rb_rot.0 * collider_transform.rotation).normalize();
+            if rotation.0.to_array().map(f32::to_bits) != next_rotation.to_array().map(f32::to_bits)
+            {
+                rotation.0 = next_rotation;
+            }
         }
     }
 }
@@ -281,3 +299,176 @@ unsafe fn propagate_collider_transforms_recursive(
 }
 
 // TODO: Add thorough tests for propagation. It's pretty error-prone and changes are risky.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::ecs::change_detection::Tick;
+
+    fn fixture(body_type: RigidBody) -> (World, Schedule, Entity, Entity) {
+        let mut world = World::new();
+        let body = world
+            .spawn((body_type, Position::default(), Rotation::IDENTITY))
+            .id();
+        let collider = world
+            .spawn((
+                ColliderOf { body },
+                ChildOf(body),
+                ColliderTransform::default(),
+                Position(RVector::splat(-999.0)),
+                Rotation::PLACEHOLDER,
+            ))
+            .id();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(update_child_collider_position);
+        (world, schedule, body, collider)
+    }
+
+    fn pose_ticks(world: &World, entity: Entity) -> (Tick, Tick) {
+        let entity = world.entity(entity);
+        (
+            entity.get_ref::<Position>().unwrap().last_changed(),
+            entity.get_ref::<Rotation>().unwrap().last_changed(),
+        )
+    }
+
+    #[test]
+    fn child_collider_pose_stationary_values_retain_change_ticks() {
+        for body_type in [RigidBody::Static, RigidBody::Dynamic, RigidBody::Kinematic] {
+            let (mut world, mut schedule, _, collider) = fixture(body_type);
+            schedule.run(&mut world);
+            assert_eq!(world.get::<Position>(collider).unwrap().0, RVector::ZERO);
+            assert_eq!(
+                *world.get::<Rotation>(collider).unwrap(),
+                Rotation::IDENTITY
+            );
+            let ticks = pose_ticks(&world, collider);
+            for _ in 0..3 {
+                schedule.run(&mut world);
+                assert_eq!(pose_ticks(&world, collider), ticks);
+            }
+        }
+    }
+
+    #[test]
+    fn child_collider_pose_tracks_body_mount_and_owner_changes() {
+        let (mut world, mut schedule, body, collider) = fixture(RigidBody::Static);
+        schedule.run(&mut world);
+        let initial = pose_ticks(&world, collider);
+        world.get_mut::<Position>(body).unwrap().0 = RVector::splat(2.0);
+        schedule.run(&mut world);
+        assert_eq!(
+            world.get::<Position>(collider).unwrap().0,
+            RVector::splat(2.0)
+        );
+        let translated = pose_ticks(&world, collider);
+        assert_ne!(translated.0, initial.0);
+        assert_eq!(translated.1, initial.1);
+
+        world
+            .get_mut::<ColliderTransform>(collider)
+            .unwrap()
+            .translation = Vector::X;
+        #[cfg(feature = "2d")]
+        let body_rotation = Rotation::degrees(90.0);
+        #[cfg(feature = "3d")]
+        let body_rotation = Rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2));
+        world.entity_mut(body).insert(body_rotation);
+        schedule.run(&mut world);
+        let expected = RVector::splat(2.0) + (body_rotation * Vector::X).real();
+        assert_eq!(world.get::<Position>(collider).unwrap().0, expected);
+        assert_ne!(pose_ticks(&world, collider).1, translated.1);
+
+        let rotated = pose_ticks(&world, collider);
+        #[cfg(feature = "2d")]
+        let mount_rotation = Rot2::radians(0.25);
+        #[cfg(feature = "3d")]
+        let mount_rotation = Quat::from_rotation_x(0.25);
+        world
+            .get_mut::<ColliderTransform>(collider)
+            .unwrap()
+            .rotation = mount_rotation;
+        schedule.run(&mut world);
+        let remounted = pose_ticks(&world, collider);
+        assert_eq!(remounted.0, rotated.0);
+        assert_ne!(remounted.1, rotated.1);
+        world
+            .get_mut::<ColliderTransform>(collider)
+            .unwrap()
+            .rotation = default();
+
+        let other_body = world
+            .spawn((
+                RigidBody::Static,
+                Position(RVector::splat(7.0)),
+                Rotation::IDENTITY,
+            ))
+            .id();
+        world
+            .entity_mut(collider)
+            .insert((ColliderOf { body: other_body }, ChildOf(other_body)));
+        schedule.run(&mut world);
+        assert_eq!(
+            world.get::<Position>(collider).unwrap().0,
+            RVector::splat(7.0) + RVector::X
+        );
+        assert_eq!(
+            *world.get::<Rotation>(collider).unwrap(),
+            Rotation::IDENTITY
+        );
+
+        // Native body/mount ownership also restores an independently edited
+        // child, even when none of its input components was changed.
+        world.get_mut::<Position>(collider).unwrap().0 = RVector::splat(100.0);
+        world.entity_mut(collider).insert(Rotation::PLACEHOLDER);
+        schedule.run(&mut world);
+        assert_eq!(
+            world.get::<Position>(collider).unwrap().0,
+            RVector::splat(7.0) + RVector::X
+        );
+        assert_eq!(
+            *world.get::<Rotation>(collider).unwrap(),
+            Rotation::IDENTITY
+        );
+    }
+
+    #[test]
+    fn child_collider_pose_compares_representations_including_signed_zero() {
+        let (mut world, mut schedule, body, collider) = fixture(RigidBody::Static);
+        schedule.run(&mut world);
+        world.get_mut::<Position>(collider).unwrap().0 = RVector::splat(-0.0);
+        #[cfg(feature = "2d")]
+        world.entity_mut(collider).insert(Rotation {
+            cos: 1.0,
+            sin: -0.0,
+        });
+        #[cfg(feature = "3d")]
+        world
+            .entity_mut(collider)
+            .insert(Rotation(Quat::from_xyzw(-0.0, -0.0, -0.0, 1.0)));
+        let changed = pose_ticks(&world, collider);
+        world.increment_change_tick();
+        schedule.run(&mut world);
+        let updated = pose_ticks(&world, collider);
+        assert_ne!(updated.0, changed.0);
+        assert_ne!(updated.1, changed.1);
+        assert!(
+            world
+                .get::<Position>(collider)
+                .unwrap()
+                .0
+                .to_array()
+                .iter()
+                .all(|v| v.to_bits() == 0)
+        );
+
+        // Non-finite source values still reach the native pose components.
+        // Stable NaN bits do not fabricate a new change every subsequent tick.
+        world.get_mut::<Position>(body).unwrap().0.x = crate::math::Real::NAN;
+        schedule.run(&mut world);
+        assert!(world.get::<Position>(collider).unwrap().0.x.is_nan());
+        let non_finite = pose_ticks(&world, collider);
+        schedule.run(&mut world);
+        assert_eq!(pose_ticks(&world, collider), non_finite);
+    }
+}

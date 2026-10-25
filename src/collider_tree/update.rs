@@ -1124,7 +1124,7 @@ mod tests {
         let colliders = [0.0, 2.0].map(|x| {
             app.world_mut()
                 .spawn((
-                    Collider::sphere(0.5),
+                    Collider::from(crate::parry::shape::SharedShape::ball(0.5)),
                     Transform::from_xyz(x, 0.0, 0.0),
                     GlobalTransform::default(),
                     ChildOf(body),
@@ -1197,7 +1197,7 @@ mod tests {
             .world_mut()
             .spawn((
                 RigidBody::Static,
-                Collider::sphere(0.5),
+                Collider::from(crate::parry::shape::SharedShape::ball(0.5)),
                 Transform::default(),
             ))
             .id();

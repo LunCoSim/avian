@@ -190,6 +190,20 @@ fn relax_joint_contact_velocities(
         .collect();
     coupled_islands.sort_unstable();
     coupled_islands.dedup();
+    // All relaxation passes share one component borrow and one joint order.
+    // No structural changes can occur until these query items are released.
+    let mut fixed: Vec<_> = fixed
+        .iter_mut()
+        .sort_unstable_by_key::<Entity, _>(|entity| entity.index())
+        .collect();
+    let mut sliders: Vec<_> = sliders
+        .iter_mut()
+        .sort_unstable_by_key::<Entity, _>(|entity| entity.index())
+        .collect();
+    let mut hinges: Vec<_> = hinges
+        .iter_mut()
+        .sort_unstable_by_key::<Entity, _>(|entity| entity.index())
+        .collect();
     apply_xpbd_joint_pass::<FixedJoint>(
         &mut solver_bodies,
         &body_indices,
@@ -319,6 +333,10 @@ pub fn prepare_xpbd_joint<
 }
 
 /// Iterates through the XPBD joints of a given type and solves them.
+///
+/// Corrections execute in ascending live entity-index order, independently of
+/// archetype table packing. Deterministic replay still requires deterministic
+/// entity creation and topology changes by the application.
 pub fn solve_xpbd_joint<
     C: Component<Mutability = Mutable> + EntityConstraint<2> + XpbdConstraint<2>,
 >(
@@ -329,6 +347,12 @@ pub fn solve_xpbd_joint<
 ) where
     C::SolverData: Component<Mutability = Mutable>,
 {
+    // Joint corrections share body state. Order by live entity slot index,
+    // independently of ECS table packing and Entity's opaque bit encoding.
+    let mut joints: Vec<_> = joints
+        .iter_mut()
+        .sort_unstable_by_key::<Entity, _>(|entity| entity.index())
+        .collect();
     apply_xpbd_joint_pass::<C>(
         &mut solver_bodies,
         &body_indices,
@@ -350,7 +374,7 @@ fn apply_xpbd_joint_pass<
 >(
     solver_bodies: &mut SolverBodies,
     body_indices: &Query<Option<&SolverBodyIndex>, (With<RigidBody>, Without<RigidBodyDisabled>)>,
-    joints: &mut Query<(&mut C, &mut C::SolverData), (Without<RigidBody>, Without<JointDisabled>)>,
+    joints: &mut [(Mut<'_, C>, Mut<'_, C::SolverData>)],
     delta_secs: f32,
     phase: JointSolverPhase,
 ) where
@@ -361,7 +385,7 @@ fn apply_xpbd_joint_pass<
     let mut dummy_body1 = SolverBody::default();
     let mut dummy_body2 = SolverBody::default();
 
-    for (mut joint, mut solver_data) in joints.iter_mut() {
+    for (joint, solver_data) in joints {
         let [entity1, entity2] = joint.entities();
 
         let Ok([index1, index2]) = body_indices.get_many([entity1, entity2]) else {
@@ -398,21 +422,19 @@ fn apply_xpbd_joint_pass<
         }
 
         match phase {
-            JointSolverPhase::PrepareVelocities => joint.prepare_velocity_projection(
-                [body1, body2],
-                [inertia1, inertia2],
-                &mut solver_data,
-            ),
+            JointSolverPhase::PrepareVelocities => {
+                joint.prepare_velocity_projection([body1, body2], [inertia1, inertia2], solver_data)
+            }
             JointSolverPhase::ProjectVelocities => joint.project_velocities(
                 [body1, body2],
                 [inertia1, inertia2],
-                &mut solver_data,
+                solver_data,
                 delta_secs,
             ),
             JointSolverPhase::Position => joint.solve(
                 [body1, body2],
                 [inertia1, inertia2],
-                &mut solver_data,
+                solver_data,
                 delta_secs,
             ),
         }

@@ -7,6 +7,90 @@ use crate::prelude::*;
 
 const TIMESTEP: f32 = 1.0 / 64.0;
 
+/// Joint traversal must not inherit the packing order of an ECS archetype.
+#[cfg(feature = "3d")]
+#[test]
+fn joint_passes_ignore_unrelated_archetype_moves() {
+    #[derive(Component)]
+    struct PresentationMarker;
+
+    fn sample(perturbation: u8) -> Vec<(Position, Rotation, LinearVelocity, AngularVelocity)> {
+        let mut app = create_app();
+        app.insert_resource(SubstepCount(8));
+        app.finish();
+        let bodies = [RVector::ZERO, RVector::X * 1.3, RVector::Y * 0.7].map(|position| {
+            app.world_mut()
+                .spawn((
+                    RigidBody::Dynamic,
+                    Position(position),
+                    Mass(1.0),
+                    AngularInertia::new(Vec3::splat(1.0)),
+                ))
+                .id()
+        });
+        let joints = [bodies[1], bodies[2]]
+            .map(|body| app.world_mut().spawn(FixedJoint::new(bodies[0], body)).id());
+        match perturbation {
+            0 => {}
+            1 => {
+                app.world_mut()
+                    .entity_mut(joints[0])
+                    .insert(PresentationMarker);
+                app.world_mut()
+                    .entity_mut(joints[0])
+                    .remove::<PresentationMarker>();
+            }
+            2 => {
+                app.world_mut().entity_mut(joints[0]).insert(JointDisabled);
+                app.world_mut()
+                    .entity_mut(joints[0])
+                    .remove::<JointDisabled>();
+            }
+            _ => unreachable!(),
+        }
+        let packed = app
+            .world_mut()
+            .query_filtered::<Entity, With<FixedJoint>>()
+            .iter(app.world())
+            .collect::<Vec<_>>();
+        if perturbation == 0 {
+            assert_eq!(packed, joints);
+        } else {
+            assert_eq!(
+                packed,
+                [joints[1], joints[0]],
+                "fixture must change query order"
+            );
+        }
+        let mut samples = Vec::new();
+        for _ in 0..4 {
+            app.update();
+            for body in bodies {
+                let entity = app.world().entity(body);
+                samples.push((
+                    *entity.get::<Position>().unwrap(),
+                    *entity.get::<Rotation>().unwrap(),
+                    *entity.get::<LinearVelocity>().unwrap(),
+                    *entity.get::<AngularVelocity>().unwrap(),
+                ));
+            }
+        }
+        samples
+    }
+
+    let baseline = sample(0);
+    assert_eq!(
+        sample(1),
+        baseline,
+        "presentation components cannot change the solve"
+    );
+    assert_eq!(
+        sample(2),
+        baseline,
+        "re-enabled joints retain their solve order"
+    );
+}
+
 fn create_app() -> App {
     let mut app = App::new();
     app.add_plugins((

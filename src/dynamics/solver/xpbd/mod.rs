@@ -377,6 +377,7 @@ pub trait XpbdConstraint<const ENTITY_COUNT: usize> {
         _bodies: [&SolverBody; ENTITY_COUNT],
         _inertias: [&SolverBodyInertia; ENTITY_COUNT],
         _solver_data: &mut Self::SolverData,
+        _dt: f32,
     ) {
     }
 

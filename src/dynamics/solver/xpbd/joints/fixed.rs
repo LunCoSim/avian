@@ -108,6 +108,7 @@ impl XpbdConstraint<2> for FixedJoint {
         bodies: [&SolverBody; 2],
         inertias: [&SolverBodyInertia; 2],
         data: &mut FixedJointSolverData,
+        _dt: f32,
     ) {
         let [a, b] = bodies;
         let r1 = a.delta_rotation * data.point_constraint.world_r1;
@@ -135,7 +136,7 @@ impl XpbdConstraint<2> for FixedJoint {
         data: &mut FixedJointSolverData,
         dt: f32,
     ) {
-        let impulse = super::shared::solve_velocity_rows(bodies, &data.velocity_cache);
+        let impulse = super::shared::solve_velocity_rows(bodies, &mut data.velocity_cache);
         data.point_constraint.total_lagrange -= dt * Vec3::new(impulse[0], impulse[1], impulse[2]);
         data.angle_constraint.total_lagrange -= dt * Vec3::new(impulse[3], impulse[4], impulse[5]);
     }

@@ -20,6 +20,10 @@ pub struct RevoluteJointSolverData {
     #[reflect(ignore)]
     #[cfg_attr(feature = "serialize", serde(skip))]
     pub(super) velocity_cache: super::shared::VelocityRowCache,
+    #[cfg(feature = "3d")]
+    #[reflect(ignore)]
+    #[cfg_attr(feature = "serialize", serde(skip))]
+    pub(super) velocity_motor_impulse: f64,
     pub(super) point_constraint: PointConstraintShared,
     #[cfg(feature = "2d")]
     pub(super) rotation_difference: f32,
@@ -175,6 +179,7 @@ impl XpbdConstraint<2> for RevoluteJoint {
         bodies: [&SolverBody; 2],
         inertias: [&SolverBodyInertia; 2],
         data: &mut RevoluteJointSolverData,
+        dt: f32,
     ) {
         let [a, b] = bodies;
         let r1 = a.delta_rotation * data.point_constraint.world_r1;
@@ -198,7 +203,17 @@ impl XpbdConstraint<2> for RevoluteJoint {
                 rows[i + 3].angular2 = -gradient;
             }
         }
+        if super::shared::velocity_drive_damping(&self.motor).is_some() {
+            rows[5].angular1 = -axis1;
+            rows[5].angular2 = axis1;
+        }
         super::shared::prepare_velocity_rows(inertias, &rows, &mut data.velocity_cache);
+        super::shared::prepare_velocity_motor(
+            &mut data.velocity_cache,
+            &self.motor,
+            dt,
+            data.velocity_motor_impulse,
+        );
     }
     #[cfg(feature = "3d")]
     fn project_velocities(
@@ -208,7 +223,8 @@ impl XpbdConstraint<2> for RevoluteJoint {
         data: &mut RevoluteJointSolverData,
         dt: f32,
     ) {
-        let impulse = super::shared::solve_velocity_rows(bodies, &data.velocity_cache);
+        let impulse = super::shared::solve_velocity_rows(bodies, &mut data.velocity_cache);
+        data.total_motor_lagrange -= dt * data.velocity_cache.gradients[5][3] * impulse[5];
         data.point_constraint.total_lagrange -= dt * Vec3::new(impulse[0], impulse[1], impulse[2]);
         data.total_align_lagrange -= dt
             * (data.velocity_cache.gradients[3][3] * impulse[3]
@@ -271,6 +287,10 @@ impl RevoluteJoint {
         dt: f32,
     ) {
         let motor = &self.motor;
+        #[cfg(feature = "3d")]
+        {
+            solver_data.velocity_motor_impulse = 0.0;
+        }
 
         if !motor.enabled {
             return;
@@ -325,6 +345,10 @@ impl RevoluteJoint {
             dt,
         );
 
+        #[cfg(feature = "3d")]
+        {
+            solver_data.velocity_motor_impulse = f64::from(delta_lagrange) / f64::from(dt);
+        }
         #[cfg(feature = "2d")]
         {
             solver_data.total_motor_lagrange -= delta_lagrange;

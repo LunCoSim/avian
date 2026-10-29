@@ -422,9 +422,12 @@ fn apply_xpbd_joint_pass<
         }
 
         match phase {
-            JointSolverPhase::PrepareVelocities => {
-                joint.prepare_velocity_projection([body1, body2], [inertia1, inertia2], solver_data)
-            }
+            JointSolverPhase::PrepareVelocities => joint.prepare_velocity_projection(
+                [body1, body2],
+                [inertia1, inertia2],
+                solver_data,
+                delta_secs,
+            ),
             JointSolverPhase::ProjectVelocities => joint.project_velocities(
                 [body1, body2],
                 [inertia1, inertia2],

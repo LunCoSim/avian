@@ -1,4 +1,5 @@
 use crate::dynamics::solver::solver_body::{SolverBody, SolverBodyInertia};
+use crate::prelude::{AngularMotor, MotorModel};
 use bevy::prelude::*;
 
 /// One scalar world-space Jacobian row. Impulse bounds apply to the accumulated
@@ -135,6 +136,7 @@ pub(crate) fn prepare_velocity_rows(
     let mb = ib.effective_inv_mass();
     let aa = ia.effective_inv_angular_inertia();
     let ab = ib.effective_inv_angular_inertia();
+    cache.motor = None;
     cache.gradients = core::array::from_fn(|i| {
         [
             rows[i].linear1,
@@ -164,16 +166,72 @@ pub(crate) fn prepare_velocity_rows(
         })
     });
     cache.factor = MobileMassFactor::new(matrix);
+    cache.mass = matrix;
+}
+
+/// Pure velocity drives share the contact relaxation solve. Position springs
+/// remain in XPBD; a velocity drive must have only one impulse owner.
+pub(crate) fn velocity_drive_damping(motor: &AngularMotor) -> Option<f64> {
+    if !motor.enabled {
+        return None;
+    }
+    match motor.motor_model {
+        MotorModel::ForceBased {
+            stiffness: 0.0,
+            damping,
+        }
+        | MotorModel::AccelerationBased {
+            stiffness: 0.0,
+            damping,
+        } if damping > 0.0 => Some(f64::from(damping)),
+        _ => None,
+    }
+}
+
+/// The sixth row is the revolute joint's driven free axis. Its torque limit
+/// bounds the accumulated substep impulse, including every contact/joint pass.
+pub(crate) fn prepare_velocity_motor(
+    cache: &mut VelocityRowCache,
+    motor: &AngularMotor,
+    dt: f32,
+    initial_impulse: f64,
+) {
+    let Some(mut damping) = velocity_drive_damping(motor) else {
+        return;
+    };
+    let mobility = cache.mass[5][5];
+    if mobility <= 0.0 || dt <= 0.0 {
+        return;
+    }
+    if matches!(motor.motor_model, MotorModel::AccelerationBased { .. }) {
+        damping /= mobility;
+    }
+    let softness = 1.0 / (f64::from(dt) * damping);
+    let mut hard_mass = cache.mass;
+    for i in 0..6 {
+        hard_mass[i][5] = 0.0;
+        hard_mass[5][i] = 0.0;
+    }
+    let mut mass = cache.mass;
+    mass[5][5] += softness;
+    cache.factor = MobileMassFactor::new(mass);
+    cache.motor = Some(VelocityMotor {
+        target: f64::from(motor.target_velocity),
+        cap: f64::from(motor.max_torque) * f64::from(dt),
+        accumulated: initial_impulse,
+        softness,
+        hard_factor: MobileMassFactor::new(hard_mass),
+    });
 }
 
 /// Project hard velocity gradients using their prepared constrained effective mass.
 /// The impulse changes velocities only; it cannot repair or overwrite a pose.
 pub(crate) fn solve_velocity_rows(
     bodies: [&mut SolverBody; 2],
-    cache: &VelocityRowCache,
+    cache: &mut VelocityRowCache,
 ) -> [f32; 6] {
     let [a, b] = bodies;
-    let rhs = core::array::from_fn(|i| {
+    let mut rhs = core::array::from_fn(|i| {
         let row = cache.gradients[i];
         -f64::from(
             row[0].dot(a.linear_velocity)
@@ -182,7 +240,25 @@ pub(crate) fn solve_velocity_rows(
                 + row[3].dot(b.angular_velocity),
         )
     });
-    let result = cache.factor.solve(rhs).map(|x| x as f32);
+    if let Some(motor) = &cache.motor {
+        rhs[5] += motor.target - motor.softness * motor.accumulated;
+    }
+    let mut result = cache.factor.solve(rhs);
+    if let Some(motor) = &mut cache.motor {
+        let bounded = result[5].clamp(
+            -motor.cap - motor.accumulated,
+            motor.cap - motor.accumulated,
+        );
+        if bounded != result[5] {
+            for i in 0..6 {
+                rhs[i] -= cache.mass[i][5] * bounded;
+            }
+            result = motor.hard_factor.solve(rhs);
+            result[5] = bounded;
+        }
+        motor.accumulated += f64::from(result[5] as f32);
+    }
+    let result = result.map(|x| x as f32);
     for (response, lambda) in cache.responses.iter().zip(result) {
         a.linear_velocity += response[0] * lambda;
         b.linear_velocity += response[1] * lambda;
@@ -277,6 +353,17 @@ pub(crate) struct VelocityRowCache {
     pub(crate) gradients: [[Vec3; 4]; 6],
     responses: [[Vec3; 4]; 6],
     factor: MobileMassFactor,
+    mass: [[f64; 6]; 6],
+    motor: Option<VelocityMotor>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct VelocityMotor {
+    target: f64,
+    cap: f64,
+    accumulated: f64,
+    softness: f64,
+    hard_factor: MobileMassFactor,
 }
 
 #[cfg(all(test, feature = "3d"))]

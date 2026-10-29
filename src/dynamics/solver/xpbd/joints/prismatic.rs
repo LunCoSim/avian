@@ -115,6 +115,7 @@ impl XpbdConstraint<2> for PrismaticJoint {
         bodies: [&SolverBody; 2],
         inertias: [&SolverBodyInertia; 2],
         data: &mut PrismaticJointSolverData,
+        _dt: f32,
     ) {
         let [a, b] = bodies;
         let r1 = a.delta_rotation * data.world_r1;
@@ -148,7 +149,7 @@ impl XpbdConstraint<2> for PrismaticJoint {
         data: &mut PrismaticJointSolverData,
         dt: f32,
     ) {
-        let impulse = super::shared::solve_velocity_rows(bodies, &data.velocity_cache);
+        let impulse = super::shared::solve_velocity_rows(bodies, &mut data.velocity_cache);
         let tangent = data.velocity_cache.gradients[0][1];
         let bitangent = data.velocity_cache.gradients[1][1];
         data.total_position_lagrange -= dt * (tangent * impulse[0] + bitangent * impulse[1]);

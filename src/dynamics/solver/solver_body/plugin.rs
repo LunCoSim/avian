@@ -312,11 +312,8 @@ fn prepare_solver_bodies(
                 // The MI around any axis passing by the center of gravity are then identical."
 
                 // TODO: Kinematic bodies should not have gyroscopic motion.
-                // TODO: Should we scale the epsilon based on the `PhysicsLengthUnit`?
                 // TODO: We should only do this when the body is added or the local inertia tensor is changed.
-                let epsilon = 1e-6;
-                let is_gyroscopic = !locked_axes.is_rotation_locked()
-                    && !angular_inertia.inverse().is_isotropic(epsilon);
+                let is_gyroscopic = gyroscopic_motion_enabled(locked_axes, *angular_inertia);
 
                 solver_body
                     .flags
@@ -385,10 +382,60 @@ pub(crate) fn update_solver_body_angular_inertia(
     );
 }
 
+#[cfg(feature = "3d")]
+fn gyroscopic_motion_enabled(locked_axes: LockedAxes, inertia: ComputedAngularInertia) -> bool {
+    if locked_axes.is_rotation_locked() {
+        return false;
+    }
+    let inverse = inertia.inverse_tensor().to_mat3().as_dmat3();
+    // Relative anisotropy is dimensionless, independent of mass and length units.
+    let scale = inverse
+        .x_axis
+        .abs()
+        .max_element()
+        .max(inverse.y_axis.abs().max_element())
+        .max(inverse.z_axis.abs().max_element());
+    scale != 0.0 && !(inverse / scale).is_isotropic(1e-6)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{PhysicsSchedulePlugin, SolverSchedulePlugin};
+
+    #[test]
+    #[cfg(feature = "3d")]
+    fn inertia_numerics_gyro_selection_is_scale_invariant() {
+        for scale in [1e-38_f32, 1e-30, 1e-17, 1.0, 1e17, 1e30, 1e38] {
+            let anisotropic = ComputedAngularInertia::new_with_local_frame(
+                Vec3::new(1.0, 1.5, 2.0) * scale,
+                Quat::from_euler(EulerRot::XYZ, 0.4, -0.7, 0.2),
+            );
+            assert!(
+                gyroscopic_motion_enabled(LockedAxes::default(), anisotropic),
+                "scale={scale}"
+            );
+            assert!(!gyroscopic_motion_enabled(
+                LockedAxes::ROTATION_LOCKED,
+                anisotropic
+            ));
+            assert!(!gyroscopic_motion_enabled(
+                LockedAxes::default(),
+                ComputedAngularInertia::new(Vec3::splat(scale))
+            ));
+            assert!(!gyroscopic_motion_enabled(
+                LockedAxes::default(),
+                ComputedAngularInertia::new_with_local_frame(
+                    Vec3::splat(scale),
+                    Quat::from_euler(EulerRot::XYZ, 0.4, -0.7, 0.2),
+                )
+            ));
+        }
+        assert!(!gyroscopic_motion_enabled(
+            LockedAxes::default(),
+            ComputedAngularInertia::INFINITY
+        ));
+    }
 
     fn create_app() -> App {
         let mut app = App::new();

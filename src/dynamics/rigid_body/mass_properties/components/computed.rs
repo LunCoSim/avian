@@ -436,6 +436,19 @@ impl Default for ComputedAngularInertia {
 }
 
 #[cfg(feature = "3d")]
+#[inline]
+fn inverse_tensor_f64(tensor: SymmetricTensor) -> glam_matrix_extras::SymmetricDMat3 {
+    glam_matrix_extras::SymmetricDMat3::from_mat3_unchecked(tensor.to_mat3().as_dmat3())
+        .inverse_or_zero()
+}
+
+#[cfg(feature = "3d")]
+#[inline]
+fn native_tensor(tensor: glam_matrix_extras::SymmetricDMat3) -> SymmetricTensor {
+    SymmetricTensor::from_mat3_unchecked(tensor.to_mat3().as_mat3())
+}
+
+#[cfg(feature = "3d")]
 impl ComputedAngularInertia {
     /// Infinite angular inertia.
     pub const INFINITY: Self = Self {
@@ -558,7 +571,7 @@ impl ComputedAngularInertia {
     #[inline]
     #[doc(alias = "from_mat3")]
     pub fn from_tensor(tensor: SymmetricTensor) -> Self {
-        Self::from_inverse_tensor(tensor.inverse_or_zero())
+        Self::from_inverse_tensor(native_tensor(inverse_tensor_f64(tensor)))
     }
 
     /// Creates a new [`ComputedAngularInertia`] from the given inverse angular inertia tensor.
@@ -602,7 +615,12 @@ impl ComputedAngularInertia {
         self.inverse_tensor_mut()
     }
 
-    /// Returns the angular inertia tensor.
+    /// Returns the angular inertia tensor in the native `f32` representation.
+    ///
+    /// Inversion is evaluated in `f64` before the explicit native conversion.
+    /// Use [`Self::tensor_f64`] to retain the widened result. A singular inverse,
+    /// including [`Self::INFINITY`], returns zero, matching the infinite-inertia
+    /// sentinel. Values outside the native return range are not clamped.
     ///
     /// Note that this involves an invertion because [`ComputedAngularInertia`] internally stores the inverse angular inertia.
     /// If multiplying by the inverse angular inertia, consider using `angular_inertia.inverse() * foo`
@@ -610,7 +628,22 @@ impl ComputedAngularInertia {
     #[inline]
     #[doc(alias = "as_mat3")]
     pub fn tensor(self) -> SymmetricTensor {
-        self.inverse.inverse_or_zero()
+        native_tensor(self.tensor_f64())
+    }
+
+    /// Returns the angular inertia tensor after widening the stored inverse
+    /// coefficients to `f64` and then inverting them.
+    ///
+    /// Products of finite `f32` coefficients can overflow or underflow during a
+    /// native determinant calculation even when the inverse is representable.
+    /// This accessor keeps those products and its result in `f64`. It does not
+    /// recover precision already lost in the stored native coefficients.
+    ///
+    /// A singular inverse, including [`Self::INFINITY`], returns the zero tensor
+    /// under the same infinite-inertia sentinel contract as [`Self::tensor`].
+    #[inline]
+    pub fn tensor_f64(self) -> glam_matrix_extras::SymmetricDMat3 {
+        inverse_tensor_f64(self.inverse)
     }
 
     /// Returns the inverse of the angular inertia tensor.
@@ -677,7 +710,7 @@ impl ComputedAngularInertia {
     /// Computes the inverse angular inertia tensor shifted by the given offset, taking into account the given mass.
     #[inline]
     pub fn shifted_inverse_tensor(&self, mass: f32, offset: Vector) -> SymmetricTensor {
-        self.shifted_tensor(mass, offset).inverse_or_zero()
+        native_tensor(inverse_tensor_f64(self.shifted_tensor(mass, offset)))
     }
 
     /// Returns `true` if the angular inertia is neither infinite nor NaN.
@@ -961,6 +994,79 @@ mod tests {
         assert!(angular_inertia.is_infinite());
         assert!(!angular_inertia.is_finite());
         assert!(!angular_inertia.is_nan());
+    }
+
+    #[test]
+    #[cfg(feature = "3d")]
+    fn inertia_numerics_tensor_f64_preserves_scale_and_rotated_frames() {
+        use bevy::math::DMat3;
+        for scale in [1e-38_f32, 1e-30, 1e-17, 1.0, 1e17, 1e30, 1e38] {
+            for rotation in [
+                Quat::IDENTITY,
+                Quat::from_euler(EulerRot::XYZ, 0.4, -0.7, 0.2),
+            ] {
+                let principal = Vector::new(1.0, 1.5, 2.0) * scale;
+                let inertia = ComputedAngularInertia::new_with_local_frame(principal, rotation);
+                let basis = DMat3::from_quat(rotation.as_dquat());
+                let expected =
+                    basis * DMat3::from_diagonal(principal.as_dvec3()) * basis.transpose();
+                let observed = DMat3::from(inertia.tensor_f64());
+                assert!(observed.is_finite());
+                assert!(
+                    (observed / f64::from(scale)).abs_diff_eq(expected / f64::from(scale), 3e-5),
+                    "scale={scale}, rotation={rotation:?}"
+                );
+                let native = inertia.tensor().to_mat3().as_dmat3();
+                assert!(native.is_finite());
+                assert!((native / f64::from(scale)).abs_diff_eq(expected / f64::from(scale), 3e-5));
+            }
+        }
+        assert_eq!(
+            ComputedAngularInertia::INFINITY.tensor_f64(),
+            glam_matrix_extras::SymmetricDMat3::ZERO
+        );
+        let singular = ComputedAngularInertia::from_inverse_tensor(SymmetricTensor::from_diagonal(
+            Vector::new(1.0, 0.0, 1.0),
+        ));
+        assert_eq!(
+            singular.tensor_f64(),
+            glam_matrix_extras::SymmetricDMat3::ZERO
+        );
+        let inverse = Vector::new(1e-38, 1.0, 1e38);
+        let spanning =
+            ComputedAngularInertia::from_inverse_tensor(SymmetricTensor::from_diagonal(inverse))
+                .tensor_f64();
+        for (actual, stored) in [spanning.m00, spanning.m11, spanning.m22]
+            .into_iter()
+            .zip(inverse.to_array())
+        {
+            assert!((actual * f64::from(stored) - 1.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "3d")]
+    fn inertia_numerics_tensor_constructor_and_shift_share_stable_inverse() {
+        for scale in [1e-30_f32, 1e-17, 1.0, 1e17, 1e30] {
+            let basis = Mat3::from_quat(Quat::from_euler(EulerRot::XYZ, 0.4, -0.7, 0.2));
+            let tensor = SymmetricTensor::from_mat3_unchecked(
+                basis * Mat3::from_diagonal(Vector::new(1.0, 1.5, 2.0) * scale) * basis.transpose(),
+            );
+            let inertia = ComputedAngularInertia::from_tensor(tensor);
+            assert!(
+                (inertia.tensor_f64().to_mat3() / f64::from(scale))
+                    .abs_diff_eq(tensor.to_mat3().as_dmat3() / f64::from(scale), 3e-5),
+                "scale={scale}"
+            );
+            let shifted_inverse = inertia
+                .shifted_inverse_tensor(0.0, Vector::ZERO)
+                .to_mat3()
+                .as_dmat3();
+            assert!((shifted_inverse * f64::from(scale)).abs_diff_eq(
+                inertia.inverse_tensor().to_mat3().as_dmat3() * f64::from(scale),
+                3e-5
+            ));
+        }
     }
 
     #[test]

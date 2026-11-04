@@ -406,6 +406,10 @@ pub fn integrate_velocities(
 ///
 /// Gyroscopic motion is important for realistic spinning behavior, and for simulating
 /// gyroscopic phenomena such as the Dzhanibekov effect.
+///
+/// Momentum and its normalization are evaluated in `f64` from the stored native
+/// inverse inertia. Only the resulting angular velocity narrows to the native
+/// vector representation, so a common inertia scale does not erase motion.
 #[cfg(feature = "3d")]
 #[inline]
 pub fn solve_gyroscopic_torque(
@@ -430,11 +434,13 @@ pub fn solve_gyroscopic_torque(
     // This is efficient, prevents energy from being introduced into the system,
     // and produces reasonably accurate results for game purposes.
 
-    // Convert angular velocity to body space so that we can use the local angular inertia.
-    let local_ang_vel = rotation.inverse() * *ang_vel;
+    // Widen before rotations, momentum products and squared norms. Inertia's
+    // physical scale must not select a different gyroscopic response.
+    let rotation = rotation.as_dquat();
+    let local_ang_vel = rotation.inverse() * ang_vel.as_dvec3();
 
     // Compute body-space angular momentum.
-    let local_momentum = local_inertia.tensor() * local_ang_vel;
+    let local_momentum = local_inertia.tensor_f64() * local_ang_vel;
 
     // The gyroscopic torque is given by:
     //
@@ -450,7 +456,8 @@ pub fn solve_gyroscopic_torque(
     // Thus, we can compute the new angular momentum as:
     //
     // L' = L + ΔL = L - Δt (ω x L)
-    let mut new_local_momentum = local_momentum - delta_secs * local_ang_vel.cross(local_momentum);
+    let mut new_local_momentum =
+        local_momentum - f64::from(delta_secs) * local_ang_vel.cross(local_momentum);
 
     // Make sure the magnitude of the angular momentum remains the same to avoid introducing
     // energy into the system due to the extrapolation done by semi-implicit Euler integration.
@@ -463,8 +470,8 @@ pub fn solve_gyroscopic_torque(
         (local_momentum.length_squared() / new_local_momentum_length_squared).sqrt();
 
     // Convert back to world-space angular velocity.
-    let local_inverse_inertia = local_inertia.inverse();
-    *ang_vel = rotation * (local_inverse_inertia * new_local_momentum);
+    let local_inverse_inertia = local_inertia.inverse_tensor().to_mat3().as_dmat3();
+    *ang_vel = (rotation * (local_inverse_inertia * new_local_momentum)).as_vec3();
 }
 
 // NOTE: If the majority of bodies have clamped velocities, it would be more efficient
@@ -565,6 +572,76 @@ mod tests {
 
     use crate::prelude::*;
     use bevy::{mesh::MeshPlugin, prelude::*, time::TimeUpdateStrategy};
+
+    #[test]
+    #[cfg(feature = "3d")]
+    fn inertia_numerics_gyro_preserves_small_principal_axis_spin() {
+        for scale in [1e-38_f32, 1e-30, 1e-17, 1.0, 1e17, 1e30, 1e38] {
+            for speed in [0.75_f32, 1e-30] {
+                for rotation in [
+                    Quat::IDENTITY,
+                    Quat::from_euler(EulerRot::XYZ, 0.2, 0.4, -0.1),
+                ] {
+                    let inertia_frame = Quat::from_rotation_y(0.3);
+                    let inertia = ComputedAngularInertia::new_with_local_frame(
+                        Vec3::new(1.0, 1.5, 2.0) * scale,
+                        inertia_frame,
+                    );
+                    let initial = rotation * (inertia_frame * Vec3::X * speed);
+                    let mut velocity = initial;
+                    super::solve_gyroscopic_torque(&mut velocity, rotation, &inertia, 1.0 / 120.0);
+                    assert!(velocity.is_finite());
+                    assert!(
+                        velocity.as_dvec3().distance(initial.as_dvec3()) / f64::from(speed) < 3e-5,
+                        "scale={scale}, speed={speed}, velocity={velocity:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "3d")]
+    fn inertia_numerics_gyro_is_scale_invariant_in_rotated_frames() {
+        let body_rotation = Quat::from_euler(EulerRot::XYZ, 0.2, 0.4, -0.1);
+        let inertia_rotation = Quat::from_euler(EulerRot::XYZ, 0.4, -0.7, 0.2);
+        let initial = body_rotation * Vec3::new(0.7, -1.1, 0.9);
+        let baseline_inertia = ComputedAngularInertia::new_with_local_frame(
+            Vec3::new(1.0, 1.5, 2.0),
+            inertia_rotation,
+        );
+        let mut baseline = initial;
+        super::solve_gyroscopic_torque(
+            &mut baseline,
+            body_rotation,
+            &baseline_inertia,
+            1.0 / 120.0,
+        );
+        assert!(
+            baseline.distance(initial) > 1e-4,
+            "off-principal gyroscopic motion must remain active"
+        );
+        for scale in [1e-38_f32, 1e-30, 1e-17, 1.0, 1e17, 1e30, 1e38] {
+            let inertia = ComputedAngularInertia::new_with_local_frame(
+                Vec3::new(1.0, 1.5, 2.0) * scale,
+                inertia_rotation,
+            );
+            let mut velocity = initial;
+            super::solve_gyroscopic_torque(&mut velocity, body_rotation, &inertia, 1.0 / 120.0);
+            assert!(velocity.is_finite());
+            assert!(
+                velocity.abs_diff_eq(baseline, 3e-5),
+                "scale={scale}, velocity={velocity:?}, baseline={baseline:?}"
+            );
+            let rotation = body_rotation.as_dquat();
+            let before = inertia.tensor_f64() * (rotation.inverse() * initial.as_dvec3());
+            let after = inertia.tensor_f64() * (rotation.inverse() * velocity.as_dvec3());
+            assert!(
+                (after.length() / before.length() - 1.0).abs() < 3e-5,
+                "scale={scale}"
+            );
+        }
+    }
 
     fn create_app() -> App {
         let mut app = App::new();

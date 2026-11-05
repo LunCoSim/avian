@@ -190,58 +190,55 @@ fn relax_joint_contact_velocities(
         .collect();
     coupled_islands.sort_unstable();
     coupled_islands.dedup();
-    // All relaxation passes share one component borrow and one joint order.
-    // No structural changes can occur until these query items are released.
+    // All relaxation passes share one component borrow, body binding and joint
+    // order. No structural changes can occur until these query items are released.
     let mut fixed: Vec<_> = fixed
         .iter_mut()
         .sort_unstable_by_key::<Entity, _>(|entity| entity.index())
+        .filter_map(|joint| bind_joint_bodies(joint, &body_indices))
         .collect();
     let mut sliders: Vec<_> = sliders
         .iter_mut()
         .sort_unstable_by_key::<Entity, _>(|entity| entity.index())
+        .filter_map(|joint| bind_joint_bodies(joint, &body_indices))
         .collect();
     let mut hinges: Vec<_> = hinges
         .iter_mut()
         .sort_unstable_by_key::<Entity, _>(|entity| entity.index())
+        .filter_map(|joint| bind_joint_bodies(joint, &body_indices))
         .collect();
     apply_xpbd_joint_pass::<FixedJoint>(
         &mut solver_bodies,
-        &body_indices,
         &mut fixed,
         dt,
         JointSolverPhase::PrepareVelocities,
     );
     apply_xpbd_joint_pass::<PrismaticJoint>(
         &mut solver_bodies,
-        &body_indices,
         &mut sliders,
         dt,
         JointSolverPhase::PrepareVelocities,
     );
     apply_xpbd_joint_pass::<RevoluteJoint>(
         &mut solver_bodies,
-        &body_indices,
         &mut hinges,
         dt,
         JointSolverPhase::PrepareVelocities,
     );
     apply_xpbd_joint_pass::<FixedJoint>(
         &mut solver_bodies,
-        &body_indices,
         &mut fixed,
         dt,
         JointSolverPhase::ProjectVelocities,
     );
     apply_xpbd_joint_pass::<PrismaticJoint>(
         &mut solver_bodies,
-        &body_indices,
         &mut sliders,
         dt,
         JointSolverPhase::ProjectVelocities,
     );
     apply_xpbd_joint_pass::<RevoluteJoint>(
         &mut solver_bodies,
-        &body_indices,
         &mut hinges,
         dt,
         JointSolverPhase::ProjectVelocities,
@@ -263,21 +260,18 @@ fn relax_joint_contact_velocities(
         diagnostics.relax_velocities += start.elapsed();
         apply_xpbd_joint_pass::<FixedJoint>(
             &mut solver_bodies,
-            &body_indices,
             &mut fixed,
             dt,
             JointSolverPhase::ProjectVelocities,
         );
         apply_xpbd_joint_pass::<PrismaticJoint>(
             &mut solver_bodies,
-            &body_indices,
             &mut sliders,
             dt,
             JointSolverPhase::ProjectVelocities,
         );
         apply_xpbd_joint_pass::<RevoluteJoint>(
             &mut solver_bodies,
-            &body_indices,
             &mut hinges,
             dt,
             JointSolverPhase::ProjectVelocities,
@@ -352,10 +346,10 @@ pub fn solve_xpbd_joint<
     let mut joints: Vec<_> = joints
         .iter_mut()
         .sort_unstable_by_key::<Entity, _>(|entity| entity.index())
+        .filter_map(|joint| bind_joint_bodies(joint, &body_indices))
         .collect();
     apply_xpbd_joint_pass::<C>(
         &mut solver_bodies,
-        &body_indices,
         &mut joints,
         time.delta_secs(),
         JointSolverPhase::Position,
@@ -369,12 +363,31 @@ enum JointSolverPhase {
     ProjectVelocities,
 }
 
+/// Bind the current solver-body mapping once for this joint borrow. Static
+/// bodies retain the native invalid-index representation; removed/disabled pairs
+/// and equal indices never enter a solver pass.
+fn bind_joint_bodies<
+    'a,
+    C: Component<Mutability = Mutable> + EntityConstraint<2> + XpbdConstraint<2>,
+>(
+    (joint, data): (Mut<'a, C>, Mut<'a, C::SolverData>),
+    body_indices: &Query<Option<&SolverBodyIndex>, (With<RigidBody>, Without<RigidBodyDisabled>)>,
+) -> Option<(Mut<'a, C>, Mut<'a, C::SolverData>, [SolverBodyIndex; 2])>
+where
+    C::SolverData: Component<Mutability = Mutable>,
+{
+    let indices = body_indices
+        .get_many(joint.entities())
+        .ok()?
+        .map(|index| index.copied().unwrap_or(SolverBodyIndex::INVALID));
+    (indices[0] != indices[1]).then_some((joint, data, indices))
+}
+
 fn apply_xpbd_joint_pass<
     C: Component<Mutability = Mutable> + EntityConstraint<2> + XpbdConstraint<2>,
 >(
     solver_bodies: &mut SolverBodies,
-    body_indices: &Query<Option<&SolverBodyIndex>, (With<RigidBody>, Without<RigidBodyDisabled>)>,
-    joints: &mut [(Mut<'_, C>, Mut<'_, C::SolverData>)],
+    joints: &mut [(Mut<'_, C>, Mut<'_, C::SolverData>, [SolverBodyIndex; 2])],
     delta_secs: f32,
     phase: JointSolverPhase,
 ) where
@@ -385,26 +398,14 @@ fn apply_xpbd_joint_pass<
     let mut dummy_body1 = SolverBody::default();
     let mut dummy_body2 = SolverBody::default();
 
-    for (joint, solver_data) in joints {
-        let [entity1, entity2] = joint.entities();
-
-        let Ok([index1, index2]) = body_indices.get_many([entity1, entity2]) else {
-            continue;
-        };
-        let index1 = index1.copied().unwrap_or(SolverBodyIndex::INVALID);
-        let index2 = index2.copied().unwrap_or(SolverBodyIndex::INVALID);
-
-        if index1 == index2 {
-            continue;
-        }
-
+    for (joint, solver_data, [index1, index2]) in joints {
         let (mut body1, mut inertia1) = (&mut dummy_body1, &SolverBodyInertia::DUMMY);
         let (mut body2, mut inertia2) = (&mut dummy_body2, &SolverBodyInertia::DUMMY);
 
         // Get the solver bodies for the two jointed bodies.
         //
         // SAFETY: The two jointed bodies are distinct, and joints are processed serially here.
-        let (b1, b2) = unsafe { access.get_pair_unchecked_mut(index1, index2) };
+        let (b1, b2) = unsafe { access.get_pair_unchecked_mut(*index1, *index2) };
         if let Some((body, inertia)) = b1 {
             body1 = body;
             inertia1 = inertia;

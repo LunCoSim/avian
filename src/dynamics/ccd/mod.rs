@@ -938,6 +938,12 @@ fn solve_continuous<H: CollisionHooks>(
         .collect();
     results.sort_unstable_by_key(|result| result.index);
 
+    // TODO: Resolve impacts through the connected joint/contact island with a
+    // shared constrained-inertia response and consistent advancement to impact.
+    // Per-body motion clipping after joint solving can invalidate attachments;
+    // large mass ratios also need coupled contact/joint convergence. Qualify
+    // head-on and rotating impacts, chains, loops and simultaneous contacts at
+    // the nominal resolution, with explicit residual and extra-CCD-work budgets.
     // Mark fast bodies and apply any time-of-impact corrections.
     //
     // Also ensure a contact pair exists for any impacts that were found,
